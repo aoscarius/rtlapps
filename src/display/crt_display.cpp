@@ -34,6 +34,17 @@ void CrtDisplay::handleResize(int newW, int newH) {
     rebuildDistortionLUT();
 }
 
+void CrtDisplay::toggleFullscreen() {
+    fullscreen_ = !fullscreen_;
+
+    const Uint32 flags = fullscreen_ ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+
+    if (SDL_SetWindowFullscreen(window_, flags) != 0) {
+        std::fprintf(stderr, "SDL_SetWindowFullscreen failed: %s\n", SDL_GetError());
+        fullscreen_ = !fullscreen_;
+    }
+}
+
 // Builds, once per canvas size, a per-pixel mapping from output (canvas)
 // coordinates back into the source picture, applying a barrel-style
 // distortion so the image bulges like a real CRT tube and the corners
@@ -53,7 +64,7 @@ void CrtDisplay::rebuildDistortionLUT() {
     int areaY = (winH_ - areaH) / 2;
 
     const float k = 0.045f;           // barrel distortion strength
-    const float vignetteStrength = 0.22f;
+    const float vignetteStrength = 0.42f;
 
     for (int y = 0; y < winH_; ++y) {
         for (int x = 0; x < winW_; ++x) {

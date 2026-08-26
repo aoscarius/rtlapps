@@ -46,6 +46,8 @@ public:
     void toggleCrtEffect() { crtEffectOn_ = !crtEffectOn_; }
     bool crtEffectOn() const { return crtEffectOn_; }
 
+    void toggleFullscreen();
+
     void handleResize(int newW, int newH);
 
     // Called with the RGBA canvas buffer + its size right before it's
@@ -84,6 +86,7 @@ private:
     std::string freqLine_     = "0.00MHZ";
     bool locked_ = false;
     bool crtEffectOn_ = true;
+    bool fullscreen_ = false;
 
     std::mt19937 rng_{std::random_device{}()};
 };

@@ -15,7 +15,7 @@ struct Config {
     int      out_width  = 320;
     int      out_height = 240;
 
-    float    sync_threshold_frac = 0.72f;
+    float    sync_threshold_frac = 0.75f;
     bool     invert = false;
 
     int      window_w = 960;

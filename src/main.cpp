@@ -16,6 +16,7 @@
 #include "display/crt_display.hpp"
 #include "display/font5x7.hpp"
 #include "display/osd_menu.hpp"
+#include "extra/stream_generator.hpp"
 
 #include <rtl-sdr.h>
 #include <SDL.h>
@@ -492,6 +493,9 @@ int main(int argc, char** argv) {
                             cfg.gain_tenth_db += 25;
                             if (!dryRun) rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
                             break;
+                        case SDLK_f:
+                            display.toggleFullscreen();
+                            break;
                     }
                 }
             }
@@ -529,69 +533,15 @@ int main(int argc, char** argv) {
 }
 
 static void fakeStreamThreadFn(const Config* cfg) {
-    constexpr size_t samplesPerChunk = 16384;
-    std::mt19937 rng(0x504F4E47u);
-    std::uniform_real_distribution<float> noise(0.0f, 1.0f);
+    constexpr std::size_t samplesPerChunk = 16384;
 
-    const int samplesPerLine = std::max(
-        1, static_cast<int>(std::lround(
-            cfg->sample_rate * cfg->line_period_us / 1'000'000.0)));
-
-    uint64_t sampleIndex = 0;
+    const uint64_t transmitterFrequency = cfg->center_freq;
+    StreamGenerator generator(*cfg, transmitterFrequency);
 
     while (g_running.load()) {
-        std::vector<uint8_t> iq(samplesPerChunk * 2);
+        g_rawQueue.push(generator.nextChunk(samplesPerChunk));
 
-        for (size_t i = 0; i < samplesPerChunk; ++i, ++sampleIndex) {
-            const float phase =
-                static_cast<float>(sampleIndex % samplesPerLine) /
-                static_cast<float>(samplesPerLine);
-
-            float level = 30.0f;
-
-            if (phase < 0.085f) {
-                level = 7.0f; // horizontal sync
-            } else if (phase > 0.16f && phase < 0.92f) {
-                const float x = (phase - 0.16f) / 0.76f;
-                const int line = static_cast<int>(
-                    (sampleIndex / samplesPerLine) %
-                    std::max(1, cfg->lines_per_field));
-                const float y = static_cast<float>(line) /
-                                std::max(1, cfg->lines_per_field);
-
-                const float t = static_cast<float>(sampleIndex) /
-                                static_cast<float>(cfg->sample_rate);
-                const float ballX = 0.15f + 0.70f *
-                    std::abs(std::fmod(t * 0.22f, 2.0f) - 1.0f);
-                const float ballY = 0.20f + 0.60f *
-                    std::abs(std::fmod(t * 0.31f, 2.0f) - 1.0f);
-
-                bool bright =
-                    std::abs(x - 0.08f) < 0.012f ||
-                    std::abs(x - 0.92f) < 0.012f ||
-                    std::abs(y - 0.08f) < 0.012f ||
-                    std::abs(y - 0.92f) < 0.012f ||
-                    (std::abs(x - 0.50f) < 0.006f &&
-                     static_cast<int>(y * 20.0f) % 2 == 0) ||
-                    (std::abs(x - ballX) < 0.025f &&
-                     std::abs(y - ballY) < 0.035f);
-
-                level = bright ? 105.0f : 42.0f;
-            }
-
-            // Deterministic salt-and-pepper noise.
-            if (noise(rng) < 0.002f)
-                level = noise(rng) < 0.5f ? 0.0f : 127.0f;
-
-            const uint8_t sample = static_cast<uint8_t>(
-                std::clamp(127.5f + level, 0.0f, 255.0f));
-
-            iq[2 * i] = sample;
-            iq[2 * i + 1] = 128;
-        }
-
-        g_rawQueue.push(std::move(iq));
         std::this_thread::sleep_for(std::chrono::duration<double>(
-            samplesPerChunk / static_cast<double>(cfg->sample_rate)));
+            static_cast<double>(samplesPerChunk) /  static_cast<double>(cfg->sample_rate)));
     }
 }
