@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pong_tv LANGUAGES CXX)
+project(rtltv LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,32 +22,32 @@ find_package(SDL2 REQUIRED)
 # pkg-config first, then a manual header/lib search.
 find_package(RTLSDR REQUIRED)
 
-add_executable(pong_tv
+add_executable(${CMAKE_PROJECT_NAME}
     src/main.cpp
     src/display/crt_display.cpp
     src/display/osd_menu.cpp
 )
 
-target_include_directories(pong_tv PRIVATE src)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 
 if(TARGET SDL2::SDL2)
-    target_link_libraries(pong_tv PRIVATE SDL2::SDL2)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL2::SDL2)
 elseif(TARGET SDL2::SDL2-static)
-    target_link_libraries(pong_tv PRIVATE SDL2::SDL2-static)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL2::SDL2-static)
 else()
     # Legacy find-module style (no imported target provided).
-    target_include_directories(pong_tv PRIVATE ${SDL2_INCLUDE_DIRS})
-    target_link_libraries(pong_tv PRIVATE ${SDL2_LIBRARIES})
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${SDL2_LIBRARIES})
 endif()
 
-target_link_libraries(pong_tv PRIVATE RTLSDR::rtlsdr Threads::Threads)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE RTLSDR::rtlsdr Threads::Threads)
 
-target_compile_options(pong_tv PRIVATE
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>
 )
 
-message(STATUS "pong_tv: SDL2 include dirs: ${SDL2_INCLUDE_DIRS}")
-message(STATUS "pong_tv: RTLSDR include dir: ${RTLSDR_INCLUDE_DIR}")
-message(STATUS "pong_tv: RTLSDR library:     ${RTLSDR_LIBRARY}")
+message(STATUS "${CMAKE_PROJECT_NAME}: SDL2 include dirs:  ${SDL2_INCLUDE_DIRS}")
+message(STATUS "${CMAKE_PROJECT_NAME}: RTLSDR include dir: ${RTLSDR_INCLUDE_DIR}")
+message(STATUS "${CMAKE_PROJECT_NAME}: RTLSDR library:     ${RTLSDR_LIBRARY}")
 
-install(TARGETS pong_tv RUNTIME DESTINATION bin)
+install(TARGETS ${CMAKE_PROJECT_NAME} RUNTIME DESTINATION bin)

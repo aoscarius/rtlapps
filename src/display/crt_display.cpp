@@ -8,7 +8,7 @@
 
 CrtDisplay::CrtDisplay(int windowW, int windowH, int sourceW, int sourceH)
     : winW_(windowW), winH_(windowH), srcW_(sourceW), srcH_(sourceH) {
-    window_ = SDL_CreateWindow("Pong-on-Chip RF Decoder - Old TV",
+    window_ = SDL_CreateWindow("RTLTV RF Decoder",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 winW_, winH_, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     renderer_ = SDL_CreateRenderer(window_, -1,
