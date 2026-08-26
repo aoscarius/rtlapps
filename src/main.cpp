@@ -25,11 +25,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <thread>
 
 static RawQueue g_rawQueue;
 static std::atomic<bool> g_running{true};
+
+static void fakeStreamThreadFn(const Config* cfg);
 
 static void rtlsdr_callback(unsigned char* buf, uint32_t len, void* /*ctx*/) {
     if (!g_running.load()) return;
@@ -76,6 +79,7 @@ static void print_usage(const char* argv0) {
         "  --invert              invert picture polarity\n"
         "  --device N            rtl-sdr device index (default 0)\n"
         "  --list                list rtl-sdr devices and exit\n"
+        "  --dry-run             use a synthetic Pong stream (simulation); no RTL-SDR required\n"
         "\n"
         "Runtime keys:\n"
         "  Tab / M     open/close the tuning menu\n"
@@ -90,6 +94,7 @@ int main(int argc, char** argv) {
     Config cfg;
     int deviceIndex = 0;
     bool listOnly = false;
+    bool dryRun = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -97,54 +102,70 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", flag); std::exit(1); }
             return argv[++i];
         };
-        if (a == "--freq") cfg.center_freq = std::stoull(next("--freq"));
-        else if (a == "--rate") cfg.sample_rate = (uint32_t)std::stoul(next("--rate"));
-        else if (a == "--gain") cfg.gain_tenth_db = std::stoi(next("--gain"));
-        else if (a == "--ppm") cfg.ppm_correction = std::stoi(next("--ppm"));
-        else if (a == "--channel") cfg.channel_number = std::stoi(next("--channel"));
-        else if (a == "--ntsc") { cfg.line_period_us = 63.5556; cfg.lines_per_field = 245; }
-        else if (a == "--pal")  { cfg.line_period_us = 64.0;    cfg.lines_per_field = 288; }
-        else if (a == "--lines-per-field") cfg.lines_per_field = std::stoi(next("--lines-per-field"));
-        else if (a == "--width") cfg.out_width = std::stoi(next("--width"));
-        else if (a == "--height") cfg.out_height = std::stoi(next("--height"));
-        else if (a == "--sync-thresh") cfg.sync_threshold_frac = std::stof(next("--sync-thresh"));
-        else if (a == "--invert") cfg.invert = true;
-        else if (a == "--device") deviceIndex = std::stoi(next("--device"));
-        else if (a == "--list") listOnly = true;
+        if      (a == "-f" || a == "--freq") cfg.center_freq = std::stoull(next("--freq"));
+        else if (a == "-r" || a == "--rate") cfg.sample_rate = (uint32_t)std::stoul(next("--rate"));
+        else if (a == "-g" || a == "--gain") cfg.gain_tenth_db = std::stoi(next("--gain"));
+        else if (a == "-p" || a == "--ppm") cfg.ppm_correction = std::stoi(next("--ppm"));
+        else if (a == "-c" || a == "--channel") cfg.channel_number = std::stoi(next("--channel"));
+        else if (a == "-N" || a == "--ntsc") { cfg.line_period_us = 63.5556; cfg.lines_per_field = 245; }
+        else if (a == "-P" || a == "--pal")  { cfg.line_period_us = 64.0;    cfg.lines_per_field = 288; }
+        else if (a == "-L" || a == "--lines-per-field") cfg.lines_per_field = std::stoi(next("--lines-per-field"));
+        else if (a == "-w" || a == "--width") cfg.out_width = std::stoi(next("--width"));
+        else if (a == "-h" || a == "--height") cfg.out_height = std::stoi(next("--height"));
+        else if (a == "-s" || a == "--sync-thresh") cfg.sync_threshold_frac = std::stof(next("--sync-thresh"));
+        else if (a == "-i" || a == "--invert") cfg.invert = true;
+        else if (a == "-D" || a == "--device") deviceIndex = std::stoi(next("--device"));
+        else if (a == "-l" || a == "--list") listOnly = true;
+        else if (a == "-d" || a == "--dry-run") dryRun = true;
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "Unknown option: %s\n", a.c_str()); print_usage(argv[0]); return 1; }
     }
 
-    int devCount = rtlsdr_get_device_count();
-    if (devCount == 0) {
-        std::fprintf(stderr, "No RTL-SDR devices found. Check USB connection/permissions (udev rules).\n");
-        return 1;
+    int devCount = 0;
+    if (!dryRun) {
+        devCount = rtlsdr_get_device_count();
+        if (devCount == 0) {
+            std::fprintf(stderr, "No RTL-SDR devices found.\n");
+            return 1;
+        }
     }
+
     if (listOnly) {
-        for (int i = 0; i < devCount; ++i) {
-            char manuf[256], product[256], serial[256];
-            rtlsdr_get_device_usb_strings(i, manuf, product, serial);
-            std::printf("Device %d: %s %s SN:%s\n", i, manuf, product, serial);
+        if (dryRun) {
+            std::printf("--dry-run selected; no RTL-SDR devices queried.\n");
+        } else {
+            for (int i = 0; i < devCount; ++i) {
+                char manuf[256], product[256], serial[256];
+                rtlsdr_get_device_usb_strings(i, manuf, product, serial);
+                std::printf("Device %d: %s %s SN:%s\n",
+                            i, manuf, product, serial);
+            }
         }
         return 0;
     }
 
     rtlsdr_dev_t* dev = nullptr;
-    if (rtlsdr_open(&dev, deviceIndex) != 0) {
-        std::fprintf(stderr, "Failed to open rtl-sdr device %d\n", deviceIndex);
-        return 1;
-    }
-    rtlsdr_set_sample_rate(dev, cfg.sample_rate);
-    rtlsdr_set_center_freq(dev, cfg.center_freq);
-    rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
-    if (cfg.gain_tenth_db < 0) {
-        rtlsdr_set_tuner_gain_mode(dev, 0);
-    } else {
-        rtlsdr_set_tuner_gain_mode(dev, 1);
-        rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
-    }
+    if (!dryRun) {
+        if (rtlsdr_open(&dev, deviceIndex) != 0) {
+            std::fprintf(stderr, "Failed to open rtl-sdr device %d\n", deviceIndex);
+            return 1;
+        }
+        rtlsdr_set_sample_rate(dev, cfg.sample_rate);
+        rtlsdr_set_center_freq(dev, cfg.center_freq);
+        rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
+        if (cfg.gain_tenth_db < 0) {
+            rtlsdr_set_tuner_gain_mode(dev, 0);
+        } else {
+            rtlsdr_set_tuner_gain_mode(dev, 1);
+            rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+        }
 
-    std::printf("Tuned to %.4f MHz, %.3f MS/s\n", cfg.center_freq / 1e6, cfg.sample_rate / 1e6);
+        std::printf("Tuned to %.4f MHz, %.3f MS/s\n",
+                    cfg.center_freq / 1e6, cfg.sample_rate / 1e6);
+    } else {
+        std::printf("Dry-run: using synthetic Pong stream at %.3f MS/s\n",
+                    cfg.sample_rate / 1e6);
+    }
 
     // Snapshot of the settings we started with, so "RESET ALL" in the
     // tuning menu has something sane to go back to.
@@ -152,7 +173,9 @@ int main(int argc, char** argv) {
 
     TunableParams params(cfg);
     FrameBuffer fb(cfg.out_width, cfg.out_height);
-    std::thread sdrThread(sdrThreadFn, dev);
+    std::thread sourceThread = dryRun
+        ? std::thread(fakeStreamThreadFn, &cfg)
+        : std::thread(sdrThreadFn, dev);
     std::thread procThread(processingThreadFn, &cfg, &params, &fb, &g_running);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -186,7 +209,7 @@ int main(int argc, char** argv) {
             long long nf = (long long)cfg.center_freq + (long long)dir * (long long)step;
             nf = std::clamp<long long>(nf, 24'000'000LL, 1'766'000'000LL);
             cfg.center_freq = (uint64_t)nf;
-            rtlsdr_set_center_freq(dev, cfg.center_freq);
+            if (!dryRun) rtlsdr_set_center_freq(dev, cfg.center_freq);
         },
         nullptr
     });
@@ -197,7 +220,7 @@ int main(int argc, char** argv) {
         [&](int dir, bool fine) {
             int step = fine ? 1 : 5;
             cfg.ppm_correction += dir * step;
-            rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
+            if (!dryRun) rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
         },
         nullptr
     });
@@ -214,8 +237,12 @@ int main(int argc, char** argv) {
             if (cfg.gain_tenth_db < 0) cfg.gain_tenth_db = 0; // leaving AGC switches to manual
             int step = fine ? 5 : 25; // 0.5dB fine / 2.5dB coarse
             cfg.gain_tenth_db = std::clamp(cfg.gain_tenth_db + dir * step, 0, 500);
-            rtlsdr_set_tuner_gain_mode(dev, 1);
-            rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+            if (!dryRun) {
+                if (!dryRun) {
+                    rtlsdr_set_tuner_gain_mode(dev, 1);
+                    rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+                }
+            }
         },
         nullptr
     });
@@ -310,13 +337,17 @@ int main(int argc, char** argv) {
             cfg.center_freq = defaults.center_freq;
             cfg.gain_tenth_db = defaults.gain_tenth_db;
             cfg.ppm_correction = defaults.ppm_correction;
-            rtlsdr_set_center_freq(dev, cfg.center_freq);
-            rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
-            if (cfg.gain_tenth_db < 0) {
-                rtlsdr_set_tuner_gain_mode(dev, 0);
-            } else {
-                rtlsdr_set_tuner_gain_mode(dev, 1);
-                rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+            if (!dryRun) {
+                rtlsdr_set_center_freq(dev, cfg.center_freq);
+                rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
+                if (cfg.gain_tenth_db < 0) {
+                    if (!dryRun) rtlsdr_set_tuner_gain_mode(dev, 0);
+                } else {
+                    if (!dryRun) {
+                        rtlsdr_set_tuner_gain_mode(dev, 1);
+                        rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+                    }
+                }
             }
             params.resetFrom(defaults);
         }
@@ -361,15 +392,21 @@ int main(int argc, char** argv) {
                                 std::min(0.95f, params.sync_threshold_frac.load() + 0.02f));
                             break;
                         case SDLK_COMMA:
-                            cfg.center_freq -= 25000; rtlsdr_set_center_freq(dev, cfg.center_freq); break;
+                            cfg.center_freq -= 25000;
+                            if (!dryRun) rtlsdr_set_center_freq(dev, cfg.center_freq);
+                            break;
                         case SDLK_PERIOD:
-                            cfg.center_freq += 25000; rtlsdr_set_center_freq(dev, cfg.center_freq); break;
+                            cfg.center_freq += 25000;
+                            if (!dryRun) rtlsdr_set_center_freq(dev, cfg.center_freq);
+                            break;
                         case SDLK_g:
                             cfg.gain_tenth_db = std::max(0, cfg.gain_tenth_db - 25);
-                            rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db); break;
+                            if (!dryRun) rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+                            break;
                         case SDLK_h:
                             cfg.gain_tenth_db += 25;
-                            rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db); break;
+                            if (!dryRun) rtlsdr_set_tuner_gain(dev, cfg.gain_tenth_db);
+                            break;
                     }
                 }
             }
@@ -394,12 +431,82 @@ int main(int argc, char** argv) {
     }
 
     g_running = false;
-    rtlsdr_cancel_async(dev);
-    sdrThread.join();
+    if (!dryRun)
+        rtlsdr_cancel_async(dev);
+    sourceThread.join();
     g_rawQueue.push({});
     procThread.join();
 
     SDL_Quit();
-    rtlsdr_close(dev);
+    if (!dryRun)
+        rtlsdr_close(dev);
     return 0;
+}
+
+static void fakeStreamThreadFn(const Config* cfg) {
+    constexpr size_t samplesPerChunk = 16384;
+    std::mt19937 rng(0x504F4E47u);
+    std::uniform_real_distribution<float> noise(0.0f, 1.0f);
+
+    const int samplesPerLine = std::max(
+        1, static_cast<int>(std::lround(
+            cfg->sample_rate * cfg->line_period_us / 1'000'000.0)));
+
+    uint64_t sampleIndex = 0;
+
+    while (g_running.load()) {
+        std::vector<uint8_t> iq(samplesPerChunk * 2);
+
+        for (size_t i = 0; i < samplesPerChunk; ++i, ++sampleIndex) {
+            const float phase =
+                static_cast<float>(sampleIndex % samplesPerLine) /
+                static_cast<float>(samplesPerLine);
+
+            float level = 30.0f;
+
+            if (phase < 0.085f) {
+                level = 7.0f; // horizontal sync
+            } else if (phase > 0.16f && phase < 0.92f) {
+                const float x = (phase - 0.16f) / 0.76f;
+                const int line = static_cast<int>(
+                    (sampleIndex / samplesPerLine) %
+                    std::max(1, cfg->lines_per_field));
+                const float y = static_cast<float>(line) /
+                                std::max(1, cfg->lines_per_field);
+
+                const float t = static_cast<float>(sampleIndex) /
+                                static_cast<float>(cfg->sample_rate);
+                const float ballX = 0.15f + 0.70f *
+                    std::abs(std::fmod(t * 0.22f, 2.0f) - 1.0f);
+                const float ballY = 0.20f + 0.60f *
+                    std::abs(std::fmod(t * 0.31f, 2.0f) - 1.0f);
+
+                bool bright =
+                    std::abs(x - 0.08f) < 0.012f ||
+                    std::abs(x - 0.92f) < 0.012f ||
+                    std::abs(y - 0.08f) < 0.012f ||
+                    std::abs(y - 0.92f) < 0.012f ||
+                    (std::abs(x - 0.50f) < 0.006f &&
+                     static_cast<int>(y * 20.0f) % 2 == 0) ||
+                    (std::abs(x - ballX) < 0.025f &&
+                     std::abs(y - ballY) < 0.035f);
+
+                level = bright ? 105.0f : 42.0f;
+            }
+
+            // Deterministic salt-and-pepper noise.
+            if (noise(rng) < 0.002f)
+                level = noise(rng) < 0.5f ? 0.0f : 127.0f;
+
+            const uint8_t sample = static_cast<uint8_t>(
+                std::clamp(127.5f + level, 0.0f, 255.0f));
+
+            iq[2 * i] = sample;
+            iq[2 * i + 1] = 128;
+        }
+
+        g_rawQueue.push(std::move(iq));
+        std::this_thread::sleep_for(std::chrono::duration<double>(
+            samplesPerChunk / static_cast<double>(cfg->sample_rate)));
+    }
 }

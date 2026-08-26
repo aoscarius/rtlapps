@@ -13,7 +13,7 @@ CrtDisplay::CrtDisplay(int windowW, int windowH, int sourceW, int sourceH)
                                 winW_, winH_, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     renderer_ = SDL_CreateRenderer(window_, -1,
                                     SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    canvasTex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA8888,
+    canvasTex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888,
                                     SDL_TEXTUREACCESS_STREAMING, winW_, winH_);
     srcGray_.assign((size_t)srcW_ * srcH_, 0);
     rebuildDistortionLUT();
@@ -29,7 +29,7 @@ void CrtDisplay::handleResize(int newW, int newH) {
     if (newW == winW_ && newH == winH_) return;
     winW_ = newW; winH_ = newH;
     if (canvasTex_) SDL_DestroyTexture(canvasTex_);
-    canvasTex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA8888,
+    canvasTex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888,
                                     SDL_TEXTUREACCESS_STREAMING, winW_, winH_);
     rebuildDistortionLUT();
 }
@@ -45,15 +45,15 @@ void CrtDisplay::rebuildDistortionLUT() {
 
     // Active picture area: a 4:3 region centered in the window with a
     // dark bezel margin, matching an old TV's screen-within-a-cabinet.
-    int margin = std::max(20, winW_ / 40);
+    int margin = std::max(12, winW_ / 70);
     int areaW = winW_ - 2 * margin;
     int areaH = winH_ - 2 * margin;
     if (areaW * 3 > areaH * 4) areaW = areaH * 4 / 3; else areaH = areaW * 3 / 4;
     int areaX = (winW_ - areaW) / 2;
     int areaY = (winH_ - areaH) / 2;
 
-    const float k = 0.18f;           // barrel distortion strength
-    const float vignetteStrength = 0.55f;
+    const float k = 0.045f;           // barrel distortion strength
+    const float vignetteStrength = 0.22f;
 
     for (int y = 0; y < winH_; ++y) {
         for (int x = 0; x < winW_; ++x) {
@@ -108,12 +108,12 @@ void CrtDisplay::render(const OverlayFn& overlay) {
             } else if (!locked_) {
                 // Unsynced: snow. Occasional lucky pixel still shows signal
                 // to sell the "fighting through interference" look.
-                uint8_t noise = (uint8_t)noiseDist(rng_);
+                uint8_t noise = static_cast<uint8_t>(noiseDist(rng_));
                 r = g = b = noise;
             } else {
-                uint8_t v = srcGray_[(size_t)e.srcIndex];
+                uint8_t v = srcGray_[static_cast<size_t>((e.srcIndex))];
                 float shaded = v * (e.shade / 255.0f);
-                r = g = b = (uint8_t)std::clamp(shaded, 0.0f, 255.0f);
+                r = g = b = static_cast<uint8_t>(std::clamp(shaded, 0.0f, 255.0f));
                 // Faint green-white phosphor tint, typical of cheap sets.
                 g = (uint8_t)std::min(255, g + 6);
             }
@@ -126,6 +126,10 @@ void CrtDisplay::render(const OverlayFn& overlay) {
                 int sx = x * srcW_ / winW_;
                 int sy = y * srcH_ / winH_;
                 uint8_t v = srcGray_[(size_t)sy * srcW_ + sx];
+                v = static_cast<uint8_t>(std::clamp(
+                    (static_cast<float>(v) - 30.0f) * 1.85f,
+                    0.0f, 255.0f));
+
                 canvasPixels_[(size_t)y * winW_ + x] = 0xFF000000u | (v << 16) | (v << 8) | v;
             }
         }
@@ -133,9 +137,8 @@ void CrtDisplay::render(const OverlayFn& overlay) {
 
     // Retro status OSD, drawn straight into the canvas buffer.
     font5x7::draw_text(canvasPixels_, winW_, winH_, 24, 18, channelLabel_, 4, 0xFF33FF33u); // big green
-    font5x7::draw_text(canvasPixels_, winW_, winH_, winW_ - 260, 18, statusLine_, 2,
-                        locked_ ? 0xFFFFDD33u : 0xFFFF5533u);
-    font5x7::draw_text(canvasPixels_, winW_, winH_, winW_ - 260, 42, freqLine_, 2, 0xFFFFDD33u);
+    font5x7::draw_text(canvasPixels_, winW_, winH_, winW_ - 130, 18, statusLine_, 2, locked_ ? 0xFFFFDD33u : 0xFFFF5533u);
+    font5x7::draw_text(canvasPixels_, winW_, winH_, winW_ - 130, 42, freqLine_, 2, 0xFFFFDD33u);
 
     // Anything drawn on top of the picture but not part of CrtDisplay
     // itself (currently: the tuning menu) hooks in here.
