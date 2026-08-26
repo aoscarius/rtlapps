@@ -34,6 +34,49 @@ static std::atomic<bool> g_running{true};
 
 static void fakeStreamThreadFn(const Config* cfg);
 
+static bool usesNtsc(const Config& cfg) {
+    return cfg.lines_per_field <= 260;
+}
+
+static uint64_t channelFrequencyHz(bool ntsc, int channel) {
+    if (ntsc) {
+        if (channel >= 2 && channel <= 4)
+            return 55'250'000ULL + (channel - 2) * 6'000'000ULL;
+        if (channel >= 5 && channel <= 6)
+            return 77'250'000ULL + (channel - 5) * 6'000'000ULL;
+        if (channel >= 7 && channel <= 13)
+            return 175'250'000ULL + (channel - 7) * 6'000'000ULL;
+        if (channel >= 14 && channel <= 69)
+            return 471'250'000ULL + (channel - 14) * 6'000'000ULL;
+    } else {
+        if (channel >= 2 && channel <= 4)
+            return 48'250'000ULL + (channel - 2) * 7'000'000ULL;
+        if (channel >= 5 && channel <= 12)
+            return 175'250'000ULL + (channel - 5) * 7'000'000ULL;
+        if (channel >= 21 && channel <= 69)
+            return 471'250'000ULL + (channel - 21) * 8'000'000ULL;
+    }
+
+    return 0;
+}
+
+static bool tuneChannel(Config& cfg, rtlsdr_dev_t* dev, bool dryRun,
+                        int channel) {
+    const uint64_t frequency =
+        channelFrequencyHz(usesNtsc(cfg), channel);
+
+    if (frequency == 0)
+        return false;
+
+    cfg.channel_number = channel;
+    cfg.center_freq = frequency;
+
+    if (!dryRun && dev != nullptr)
+        rtlsdr_set_center_freq(dev, frequency);
+
+    return true;
+}
+
 static void rtlsdr_callback(unsigned char* buf, uint32_t len, void* /*ctx*/) {
     if (!g_running.load()) return;
     std::vector<uint8_t> copy(buf, buf + len);
@@ -70,7 +113,7 @@ static void print_usage(const char* argv0) {
         "  --rate HZ             sample rate (default 3200000)\n"
         "  --gain TENTH_DB       manual RF gain *10 (e.g. 400 = 40.0 dB), or -1 for AGC\n"
         "  --ppm N               tuner PPM correction\n"
-        "  --channel N           cosmetic channel number for the OSD (default 3)\n"
+        "  --channel N           tune TV channel N using the selected NTSC/PAL table\n"
         "  --ntsc                NTSC line timing (63.5556us / 245 lines/field) [default]\n"
         "  --pal                 PAL line timing (64us / 288 lines/field)\n"
         "  --lines-per-field N   override field length used for frame flip\n"
@@ -96,17 +139,20 @@ int main(int argc, char** argv) {
     bool listOnly = false;
     bool dryRun = false;
 
+    bool freqExplicit = false;
+    bool channelExplicit = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&](const char* flag) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", flag); std::exit(1); }
             return argv[++i];
         };
-        if      (a == "-f" || a == "--freq") cfg.center_freq = std::stoull(next("--freq"));
+        if      (a == "-f" || a == "--freq") {cfg.center_freq = std::stoull(next("--freq")); freqExplicit = true;} 
         else if (a == "-r" || a == "--rate") cfg.sample_rate = (uint32_t)std::stoul(next("--rate"));
         else if (a == "-g" || a == "--gain") cfg.gain_tenth_db = std::stoi(next("--gain"));
         else if (a == "-p" || a == "--ppm") cfg.ppm_correction = std::stoi(next("--ppm"));
-        else if (a == "-c" || a == "--channel") cfg.channel_number = std::stoi(next("--channel"));
+        else if (a == "-c" || a == "--channel") {cfg.channel_number = std::stoi(next("--channel")); channelExplicit = true;} 
         else if (a == "-N" || a == "--ntsc") { cfg.line_period_us = 63.5556; cfg.lines_per_field = 245; }
         else if (a == "-P" || a == "--pal")  { cfg.line_period_us = 64.0;    cfg.lines_per_field = 288; }
         else if (a == "-L" || a == "--lines-per-field") cfg.lines_per_field = std::stoi(next("--lines-per-field"));
@@ -119,6 +165,15 @@ int main(int argc, char** argv) {
         else if (a == "-d" || a == "--dry-run") dryRun = true;
         else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "Unknown option: %s\n", a.c_str()); print_usage(argv[0]); return 1; }
+    }
+
+    if (channelExplicit && !freqExplicit) {
+        if (!tuneChannel(cfg, nullptr, true, cfg.channel_number)) {
+            std::fprintf(stderr, "Invalid channel %d for %s\n",
+                         cfg.channel_number,
+                         usesNtsc(cfg) ? "NTSC" : "PAL");
+            return 1;
+        }
     }
 
     int devCount = 0;
@@ -196,6 +251,34 @@ int main(int argc, char** argv) {
     // decode-side settings write into the atomics in `params` that
     // SyncSeparator reads on the processing thread.
     OsdMenu menu;
+
+    menu.addItem(MenuItem{
+        "CHANNEL",
+        [&]() {
+            return std::string("CH") +
+                   std::to_string(cfg.channel_number);
+        },
+        [&](int dir, bool fine) {
+            (void)fine;
+
+            const bool ntsc = usesNtsc(cfg);
+            int channel = cfg.channel_number + (dir > 0 ? 1 : -1);
+
+            while (channel >= 2 && channel <= 69 &&
+                   channelFrequencyHz(ntsc, channel) == 0) {
+                channel += dir > 0 ? 1 : -1;
+            }
+
+            if (channel < 2 || channel > 69)
+                return;
+
+            if (tuneChannel(cfg, dev, dryRun, channel)) {
+                display.setChannelLabel(
+                    "CH" + std::to_string(cfg.channel_number));
+            }
+        },
+        nullptr
+    });
 
     menu.addItem(MenuItem{
         "FREQ",
@@ -335,6 +418,7 @@ int main(int argc, char** argv) {
         nullptr,
         [&]() {
             cfg.center_freq = defaults.center_freq;
+            cfg.channel_number = defaults.channel_number;
             cfg.gain_tenth_db = defaults.gain_tenth_db;
             cfg.ppm_correction = defaults.ppm_correction;
             if (!dryRun) {
@@ -350,6 +434,7 @@ int main(int argc, char** argv) {
                 }
             }
             params.resetFrom(defaults);
+            display.setChannelLabel("CH" + std::to_string(cfg.channel_number));
         }
     });
 
@@ -392,11 +477,11 @@ int main(int argc, char** argv) {
                                 std::min(0.95f, params.sync_threshold_frac.load() + 0.02f));
                             break;
                         case SDLK_COMMA:
-                            cfg.center_freq -= 25000;
+                            cfg.center_freq = cfg.center_freq >= 25'000 ? cfg.center_freq - 25'000 : 0;
                             if (!dryRun) rtlsdr_set_center_freq(dev, cfg.center_freq);
                             break;
                         case SDLK_PERIOD:
-                            cfg.center_freq += 25000;
+                            cfg.center_freq = std::min<uint64_t>(cfg.center_freq + 25'000, 1'766'000'000ULL);
                             if (!dryRun) rtlsdr_set_center_freq(dev, cfg.center_freq);
                             break;
                         case SDLK_g:
