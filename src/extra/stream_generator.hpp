@@ -3,6 +3,7 @@
 #include "dsp/config.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -17,19 +18,14 @@ enum class vEffect {
 
 class StreamGenerator {
 public:
-    StreamGenerator(const Config& cfg, uint64_t transmitterFrequencyHz, vEffect effect = vEffect::Pong)
+    StreamGenerator(const Config& cfg, uint64_t transmitterFrequencyHz)
         : cfg_(cfg),
           transmitterFrequencyHz_(transmitterFrequencyHz),
-          currentEffect_(effect),
           rng_(0x504F4E47u),
           noise_(0.0f, 1.0f) {}
 
     void setTransmitterFrequency(uint64_t frequencyHz) {
         transmitterFrequencyHz_ = frequencyHz;
-    }
-
-    void setVisualEffect(vEffect effect) {
-        currentEffect_ = effect;
     }
 
     std::vector<uint8_t> nextChunk(std::size_t sampleCount) {
@@ -46,22 +42,40 @@ public:
         const int linesPerField =
             std::max(1, cfg_.lines_per_field);
 
-        const double frequencyOffset =
+        constexpr float noiseSigma = 0.8f;
+        constexpr float centerAmplitude = 90.0f;
+        constexpr float sideAmplitude = 35.0f;
+        constexpr double frequencySpacingHz = 6'000'000.0;
+
+        const std::array<double, 3> frequencyOffsets = {
             static_cast<double>(transmitterFrequencyHz_) -
-            static_cast<double>(cfg_.center_freq);
+                static_cast<double>(cfg_.center_freq),
+            static_cast<double>(transmitterFrequencyHz_) +
+                frequencySpacingHz -
+                static_cast<double>(cfg_.center_freq),
+            static_cast<double>(transmitterFrequencyHz_) -
+                frequencySpacingHz -
+                static_cast<double>(cfg_.center_freq)
+        };
 
-        const double phaseStep =
-            2.0 * kPi * frequencyOffset / sampleRate;
+        const std::array<vEffect, 3> effects = {
+            vEffect::Pong,
+            vEffect::Joke,
+            vEffect::Clock
+        };
 
-        // Simulated tuner/channel response.
-        constexpr double channelBandwidthHz = 1'500'000.0;
-        const double normalizedOffset =
-            frequencyOffset / channelBandwidthHz;
-        const float rfGain = static_cast<float>(
-            std::exp(-0.5 * normalizedOffset * normalizedOffset));
+        const std::array<double, 3> phaseSteps = {
+            2.0 * kPi * frequencyOffsets[0] / sampleRate,
+            2.0 * kPi * frequencyOffsets[1] / sampleRate,
+            2.0 * kPi * frequencyOffsets[2] / sampleRate
+        };
 
-        constexpr float noiseSigma = 1.5f;
-        constexpr float carrierAmplitude = 110.0f;
+        std::array<bool, 3> active = {};
+
+        for (std::size_t carrier = 0; carrier < active.size(); ++carrier) {
+            active[carrier] =
+                std::abs(frequencyOffsets[carrier]) < sampleRate * 0.45;
+        }
 
         for (std::size_t n = 0; n < sampleCount; ++n) {
             const uint64_t absoluteSample = sampleIndex_++;
@@ -89,36 +103,44 @@ public:
             const int line = static_cast<int>(
                 lineNumber % static_cast<uint64_t>(linesPerField));
 
-            float envelope = videoBlack();
+            const float x = (t - 0.180f) / 0.740f;
+            const float y =
+                static_cast<float>(line) /
+                static_cast<float>(linesPerField);
 
-            if (t < 0.075f) {
-                envelope = syncTip();       // highest envelope
-            } else if (t < 0.180f) {
-                envelope = videoBlack();
-            } else if (t < 0.920f) {
-                const float x = (t - 0.180f) / 0.740f;
-                const float y =
-                    static_cast<float>(line) /
-                    static_cast<float>(linesPerField);
+            float i = 127.5f;
+            float q = 127.5f;
 
-                envelope = dispatchRender(x, y, lineNumber);
+            for (std::size_t carrier = 0; carrier < 3; ++carrier) {
+                if (!active[carrier]) {
+                    continue;
+                }
+
+                float envelope = videoBlack();
+
+                if (t < 0.075f) {
+                    envelope = syncTip();
+                } else if (t >= 0.180f && t < 0.920f) {
+                    envelope = dispatchRender(
+                        x, y, lineNumber, effects[carrier]);
+                }
+
+                const double phase = std::remainder(
+                    phaseSteps[carrier] *
+                        static_cast<double>(absoluteSample),
+                    2.0 * kPi);
+
+                const float amplitude =
+                    envelope *
+                    (carrier == 0 ? centerAmplitude : sideAmplitude);
+
+                i += amplitude * static_cast<float>(std::cos(phase));
+                q += amplitude * static_cast<float>(std::sin(phase));
             }
 
-            const double phase =
-                phaseStep * static_cast<double>(absoluteSample);
-
-            const float amplitude =
-                carrierAmplitude * rfGain * envelope;
-
-            const float i =
-                127.5f + amplitude *
-                static_cast<float>(std::cos(phase)) +
-                noiseSigma * noise_(rng_);
-
-            const float q =
-                127.5f + amplitude *
-                static_cast<float>(std::sin(phase)) +
-                noiseSigma * noise_(rng_);
+            // Noise remains when the receiver is mistuned.
+            i += noiseSigma * noise_(rng_);
+            q += noiseSigma * noise_(rng_);
 
             iq[2 * n] = sampleByte(i);
             iq[2 * n + 1] = sampleByte(q);
@@ -141,8 +163,8 @@ private:
             static_cast<int>(std::lround(value)), 0, 255));
     }
 
-    float dispatchRender(float x, float y, uint64_t lineNumber) const {
-        switch (currentEffect_) {
+    float dispatchRender(float x, float y, uint64_t lineNumber, vEffect effect = vEffect::Pong) const {
+        switch (effect) {
             case vEffect::Clock:
                 return renderClock(x, y, lineNumber);
             case vEffect::Joke:
@@ -256,7 +278,6 @@ private:
 
     const Config& cfg_;
     uint64_t transmitterFrequencyHz_;
-    vEffect currentEffect_;
     uint64_t sampleIndex_ = 0;
     std::mt19937 rng_;
     std::normal_distribution<float> noise_;
