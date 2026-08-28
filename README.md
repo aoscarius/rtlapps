@@ -1,4 +1,4 @@
-# pong_tv — RTL-SDR Blog V4 decoder for "Pong on a chip" RF video → old-TV SDL2 window
+# RTLTV — RTL-SDR Blog V4 decoder for "Pong on a chip" RF video and similar (SDL2 window)
 
 Cheap plug-and-play "TV Games" (Pong/Tennis/Breakout-on-a-chip consoles) don't
 transmit a digital protocol. They generate analog composite video (NTSC or
@@ -21,8 +21,28 @@ src/dsp/sync_separator.hpp  AM envelope -> horizontal sync -> scanlines -> frame
 src/dsp/frame_buffer.hpp    double-buffered frame handoff to the render thread
 src/dsp/tunable_params.hpp  atomics for the parameters the menu/keys adjust live, shared
                              safely between the main thread and the DSP processing thread
+src/dsp/composite_separator.hpp  NTSC/PAL COLOR decoder (--c64): burst-locked
+                             synchronous chroma demod + notch-filtered luma + YUV->RGB,
+                             works for either standard (selected the same way the mono
+                             path already does, via lines_per_field -- see its header
+                             comment for the sample-rate requirement, the one NTSC-vs-PAL
+                             difference that needs actual code, i.e. PAL's V-switch, and
+                             what's simplified vs a real broadcast decoder)
+src/dsp/file_recorder.hpp   thread-safe raw-IQ-to-file writer, tees whatever source is active
+src/extra/stream_generator.hpp        --dry-run synthetic signal: three simultaneous
+                             mono carriers 6MHz apart (matching real NTSC channel
+                             spacing) -- a CPU-vs-CPU Pong match on the tuned
+                             frequency, an analog clock face 6MHz up, a glitch/static
+                             pattern 6MHz down -- so channel-scanning behavior is
+                             actually exercisable against --dry-run, not just a
+                             single fixed signal
+src/extra/composite_generator.hpp --dry-run --c64 synthetic NTSC or PAL
+                             color-bars signal (whichever --ntsc/--pal selected), used
+                             to validate composite_separator.hpp against known
+                             ground truth on both standards
 src/display/crt_display.*   SDL2 renderer: barrel-distortion LUT, scanlines, vignette,
-                             snow, and a hand-rolled 5x7 font OSD (no SDL_ttf dependency)
+                             snow, and a hand-rolled 5x7 font OSD (no SDL_ttf dependency).
+                             Handles both grayscale (mono) and RGB (--c64) source frames.
 src/display/osd_menu.*      keyboard+mouse tuning menu, drawn on top of the picture
 src/display/font5x7.hpp     the shared bitmap font used by both OSDs
 ```
@@ -63,16 +83,91 @@ error.
 ## Run
 
 ```bash
-./build/pong_tv --list                 # list connected dongles
+./build/rtltv --list                 # list connected dongles
 
-./build/pong_tv                        # NTSC channel 3 (61.25 MHz), default settings
-./build/pong_tv --freq 67250000        # NTSC channel 4
-./build/pong_tv --pal --freq 55250000  # PAL region
+./build/rtltv                        # NTSC channel 3 (61.25 MHz), default settings
+./build/rtltv --freq 67250000        # NTSC channel 4
+./build/rtltv --pal --freq 55250000  # PAL region
 
-./build/pong_tv --freq 61250000 --gain 300 --sync-thresh 0.65 --channel 3
+./build/rtltv --freq 61250000 --gain 300 --sync-thresh 0.65 --channel 3
 ```
 
-Full flag list: `./build/pong_tv --help`
+Full flag list: `./build/rtltv --help`
+
+`--dry-run` (no hardware needed) transmits three simulated stations 6MHz
+apart, matching real NTSC channel spacing: a live Pong CPU-vs-CPU match
+on the tuned frequency, an analog clock face 6MHz up, and a glitch/static
+pattern 6MHz down. Use `CHANNEL` in the tuning menu (or `--channel N`) to
+actually exercise channel-scanning against it instead of only ever
+seeing one fixed test signal.
+
+## Color decode: --c64
+
+By default this decodes **monochrome** composite video (Pong-on-a-chip
+consoles never had color). `--c64` switches to a real **color** decoder
+instead, for sources that do carry chroma — a Commodore 64's RF modulator
+output being the obvious one, but this applies to any NTSC or PAL
+composite-over-RF source. It works with whichever standard `--ntsc`/
+`--pal` already selects (NTSC by default, same as the mono path) — `--c64`
+only changes *whether* color is decoded, not which broadcast standard.
+
+```bash
+./build/rtltv --c64 --freq 61250000            # NTSC color (default standard)
+./build/rtltv --c64 --pal --freq 591250000     # PAL color, e.g. UK UHF ch36-ish
+```
+
+**Read this before expecting it to work:** the color subcarrier sits well
+above the video carrier — 3.579545 MHz for NTSC, 4.43361875 MHz for PAL.
+Capturing either without aliasing needs roughly **8-10+ MS/s** — far more
+than the 3.2 MS/s the mono path uses. `--c64` raises the default `--rate`
+to 10000000 automatically (safely covers both standards; override with
+an explicit `--rate` if you want), but whether an RTL-SDR Blog V4
+actually sustains that reliably over your particular USB connection is
+genuinely hardware/host dependent — you may need to experiment. Full
+technical details, including exactly what's simplified compared to a
+real broadcast decoder (no delay-line comb filter, so expect more
+dot-crawl/color-fringing than a real TV), the one real difference
+between the two standards this decoder actually implements (PAL's
+V-switch; NTSC has no such thing and the code explicitly avoids letting
+noise fake one), and why there's a `HUE` control in the menu (no
+absolute phase reference to the real broadcast subcarrier — same reason
+old NTSC sets had a hue knob, and it also absorbs NTSC's fixed I/Q-vs-U/V
+axis offset since this decoder doesn't model that separately), are in
+`src/dsp/composite_separator.hpp`'s header comment.
+
+Test it without hardware: `--dry-run --c64` generates a standard 8-bar
+color-bar test pattern (white/yellow/cyan/green/magenta/red/blue/black,
+NTSC or PAL depending on `--ntsc`/`--pal`) instead of the mono Pong simulation, so you can confirm the
+color path is working (and see how `HUE`/`H-POS`/`SYNC LVL` etc. affect
+a known reference image) before pointing it at a real signal.
+
+## Recording and playback
+
+Two flags let you decouple "capture the RF" from "look at the picture":
+
+```bash
+# Grab 30 seconds of whatever's currently being decoded (live, --dry-run,
+# or even a --play-file source) to a raw IQ file:
+./build/rtltv --record capture.iq --record-seconds 30
+
+# Later (no dongle needed), decode from that file instead of a live one:
+./build/rtltv --play-file capture.iq
+```
+
+- `--record FILE` tees the raw interleaved-u8-I/Q stream to `FILE` as
+  it's produced. Omit `--record-seconds` to record until you quit the
+  program instead of stopping automatically. This is the *exact* format
+  the `rtl_sdr` command-line tool itself writes, so files recorded here
+  also work with other SDR tools (GNU Radio, `rtl_sdr`-compatible
+  utilities, etc.), and files from those tools work with `--play-file`.
+- `--play-file FILE` replaces the live dongle with a file, paced at the
+  same rate real capture would be so decode timing behaves identically.
+  It loops back to the start at end-of-file by default; pass `--no-loop`
+  to stop there instead (the picture just freezes — the window stays
+  open, nothing crashes).
+- Recording and playback both work in mono and `--c64` color mode.
+- While recording, a small red `REC 12S` indicator shows in the
+  bottom-right of the window (hidden while the tuning menu is open).
 
 ## Tuning menu
 
@@ -81,6 +176,7 @@ and picture alignment without restarting the program:
 
 | Item        | What it does                                                             |
 |-------------|---------------------------------------------------------------------------|
+| `CHANNEL`   | steps through the standard NTSC/PAL broadcast channel table               |
 | `FREQ`      | video carrier frequency -- the main thing for *acquiring* the signal      |
 | `PPM`       | tuner frequency correction (crystal drift)                                |
 | `GAIN`      | manual RF gain                                                             |
@@ -90,6 +186,7 @@ and picture alignment without restarting the program:
 | `H-WIDTH`   | zooms the picture in/out horizontally (fixes a stretched/squeezed image)  |
 | `V-SHIFT`   | rotates the picture up/down without touching the vertical lock            |
 | `INVERT`    | flips black/white polarity                                                 |
+| `HUE`       | *(--c64 only)* rotates recovered color hue -- see "Color decode" above    |
 | `CRT FX`    | toggles the barrel-distortion/scanline/vignette treatment                 |
 | `RESET ALL` | restores every one of the above to the values the program started with    |
 
@@ -131,6 +228,7 @@ Esc or Tab/M to go back to those.
 |-----------|-------------------------------------|
 | `Tab`/`M` | open the tuning menu                |
 | `r`       | toggle CRT effect (distortion/scanlines/vignette) on/off |
+| `f`       | toggle fullscreen                    |
 | `[` `]`   | sync threshold down / up            |
 | `,` `.`   | center frequency down / up 25 kHz   |
 | `g` `h`   | tuner gain down / up                 |

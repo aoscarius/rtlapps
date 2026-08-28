@@ -6,8 +6,8 @@
 #include <cmath>
 #include <cstdio>
 
-CrtDisplay::CrtDisplay(int windowW, int windowH, int sourceW, int sourceH)
-    : winW_(windowW), winH_(windowH), srcW_(sourceW), srcH_(sourceH) {
+CrtDisplay::CrtDisplay(int windowW, int windowH, int sourceW, int sourceH, int channels)
+    : winW_(windowW), winH_(windowH), srcW_(sourceW), srcH_(sourceH), channels_(channels) {
     window_ = SDL_CreateWindow("RTLTV RF Decoder",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 winW_, winH_, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -15,7 +15,7 @@ CrtDisplay::CrtDisplay(int windowW, int windowH, int sourceW, int sourceH)
                                     SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     canvasTex_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888,
                                     SDL_TEXTUREACCESS_STREAMING, winW_, winH_);
-    srcGray_.assign((size_t)srcW_ * srcH_, 0);
+    srcPixels_.assign((size_t)srcW_ * srcH_ * channels_, 0);
     rebuildDistortionLUT();
 }
 
@@ -97,12 +97,12 @@ void CrtDisplay::rebuildDistortionLUT() {
     canvasPixels_.assign((size_t)winW_ * winH_, 0xFF000000u); // opaque black
 }
 
-void CrtDisplay::updateFrame(const std::vector<uint8_t>& gray) {
-    if (gray.size() == srcGray_.size()) {
-        srcGray_ = gray;
-    } else if (!gray.empty()) {
+void CrtDisplay::updateFrame(const std::vector<uint8_t>& pixels) {
+    if (pixels.size() == srcPixels_.size()) {
+        srcPixels_ = pixels;
+    } else if (!pixels.empty()) {
         // Defensive: source size mismatch, just take what fits.
-        std::copy_n(gray.begin(), std::min(gray.size(), srcGray_.size()), srcGray_.begin());
+        std::copy_n(pixels.begin(), std::min(pixels.size(), srcPixels_.size()), srcPixels_.begin());
     }
 }
 
@@ -121,11 +121,19 @@ void CrtDisplay::render(const OverlayFn& overlay) {
                 // to sell the "fighting through interference" look.
                 uint8_t noise = static_cast<uint8_t>(noiseDist(rng_));
                 r = g = b = noise;
+            } else if (channels_ >= 3) {
+                size_t base = (size_t)e.srcIndex * 3;
+                float shade = e.shade / 255.0f;
+                r = static_cast<uint8_t>(std::clamp(srcPixels_[base + 0] * shade, 0.0f, 255.0f));
+                g = static_cast<uint8_t>(std::clamp(srcPixels_[base + 1] * shade, 0.0f, 255.0f));
+                b = static_cast<uint8_t>(std::clamp(srcPixels_[base + 2] * shade, 0.0f, 255.0f));
             } else {
-                uint8_t v = srcGray_[static_cast<size_t>((e.srcIndex))];
+                uint8_t v = srcPixels_[static_cast<size_t>(e.srcIndex)];
                 float shaded = v * (e.shade / 255.0f);
                 r = g = b = static_cast<uint8_t>(std::clamp(shaded, 0.0f, 255.0f));
-                // Faint green-white phosphor tint, typical of cheap sets.
+                // Faint green-white phosphor tint, typical of cheap
+                // monochrome sets -- only applied in grayscale mode,
+                // since a genuine color signal shouldn't get a fake tint.
                 g = (uint8_t)std::min(255, g + 6);
             }
             canvasPixels_[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
@@ -136,12 +144,19 @@ void CrtDisplay::render(const OverlayFn& overlay) {
             for (int x = 0; x < winW_; ++x) {
                 int sx = x * srcW_ / winW_;
                 int sy = y * srcH_ / winH_;
-                uint8_t v = srcGray_[(size_t)sy * srcW_ + sx];
-                v = static_cast<uint8_t>(std::clamp(
-                    (static_cast<float>(v) - 30.0f) * 1.85f,
-                    0.0f, 255.0f));
-
-                canvasPixels_[(size_t)y * winW_ + x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+                size_t srcIdx = (size_t)sy * srcW_ + sx;
+                uint8_t r, g, b;
+                if (channels_ >= 3) {
+                    size_t base = srcIdx * 3;
+                    r = srcPixels_[base + 0]; g = srcPixels_[base + 1]; b = srcPixels_[base + 2];
+                } else {
+                    uint8_t v = srcPixels_[srcIdx];
+                    v = static_cast<uint8_t>(std::clamp(
+                        (static_cast<float>(v) - 30.0f) * 1.85f,
+                        0.0f, 255.0f));
+                    r = g = b = v;
+                }
+                canvasPixels_[(size_t)y * winW_ + x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
             }
         }
     }

@@ -28,14 +28,19 @@ struct SDL_Texture;
 
 class CrtDisplay {
 public:
-    CrtDisplay(int windowW, int windowH, int sourceW, int sourceH);
+    // `channels` is 1 for grayscale (mono decoder) or 3 for interleaved
+    // RGB (color decoder, --c64) -- must match whatever FrameBuffer/
+    // frames given to updateFrame() use.
+    CrtDisplay(int windowW, int windowH, int sourceW, int sourceH, int channels = 1);
     ~CrtDisplay();
 
     CrtDisplay(const CrtDisplay&) = delete;
     CrtDisplay& operator=(const CrtDisplay&) = delete;
 
-    // Upload a new source frame (sourceW * sourceH, 8-bit grayscale).
-    void updateFrame(const std::vector<uint8_t>& gray);
+    // Upload a new source frame: sourceW*sourceH bytes for channels==1
+    // (grayscale), or sourceW*sourceH*3 interleaved RGB bytes for
+    // channels==3.
+    void updateFrame(const std::vector<uint8_t>& pixels);
 
     // OSD / status inputs, set as often as you like -- cheap.
     void setChannelLabel(const std::string& text) { channelLabel_ = text; }
@@ -70,15 +75,17 @@ private:
 
     int winW_, winH_;
     int srcW_, srcH_;
+    int channels_;
 
     // Distortion LUT: for every canvas pixel, either the source pixel
     // index to sample (>=0) or -1 if it falls outside the tube (black).
     // Paired with a precomputed brightness multiplier (vignette +
-    // per-row scanline factor baked in as a byte 0..255).
+    // per-row scanline factor baked in as a byte 0..255). srcIndex is a
+    // *pixel* index (multiply by channels_ to get the byte offset).
     struct LutEntry { int32_t srcIndex; uint8_t shade; };
     std::vector<LutEntry> lut_;
 
-    std::vector<uint8_t> srcGray_;      // last uploaded source frame
+    std::vector<uint8_t> srcPixels_;    // last uploaded source frame (1 or 3 bytes/pixel)
     std::vector<uint32_t> canvasPixels_; // scratch RGBA canvas, rebuilt each render
 
     std::string channelLabel_ = "CH3";

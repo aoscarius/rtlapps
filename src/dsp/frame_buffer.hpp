@@ -1,4 +1,8 @@
 #pragma once
+// Generalized over a channel count so the same class serves both the
+// grayscale mono path (channels=1, one byte/pixel) and the C64 color
+// path (channels=3, interleaved RGB) without duplicating the
+// double-buffering/locking logic.
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -6,12 +10,18 @@
 
 class FrameBuffer {
 public:
-    FrameBuffer(int w, int h) : w_(w), h_(h), back_(w * h, 0), front_(w * h, 0) {}
+    FrameBuffer(int w, int h, int channels = 1)
+        : w_(w), h_(h), channels_(channels),
+          back_((size_t)w * h * channels, 0), front_((size_t)w * h * channels, 0) {}
 
+    // `pixels` must hold width()*channels() bytes (e.g. RGB-interleaved
+    // for channels()==3), matching one scanline.
     void writeLine(int lineIndex, const std::vector<uint8_t>& pixels) {
         std::lock_guard<std::mutex> lk(mtx_);
         if (lineIndex < 0 || lineIndex >= h_) return;
-        std::memcpy(&back_[(size_t)lineIndex * w_], pixels.data(), std::min((size_t)w_, pixels.size()));
+        size_t rowBytes = (size_t)w_ * channels_;
+        std::memcpy(&back_[(size_t)lineIndex * rowBytes], pixels.data(),
+                    std::min(rowBytes, pixels.size()));
     }
 
     void commitFrame() {
@@ -44,9 +54,10 @@ public:
 
     int width() const { return w_; }
     int height() const { return h_; }
+    int channels() const { return channels_; }
 
 private:
-    int w_, h_;
+    int w_, h_, channels_;
     std::vector<uint8_t> back_, front_;
     std::mutex mtx_;
     bool newFrame_ = false;

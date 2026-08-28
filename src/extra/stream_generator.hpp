@@ -71,10 +71,26 @@ public:
         };
 
         std::array<bool, 3> active = {};
+        std::array<float, 3> selectivity = {};
 
+        // Emulated tuner/front-end selectivity: a Gaussian roll-off
+        // centered on each carrier's own frequency, so tuning away from
+        // it fades the signal progressively (and the sync separator
+        // gradually loses lock) instead of the old hard cutoff at
+        // sampleRate*0.45, which just snapped a carrier fully on/off.
+        // Width is tied to the sample rate the same way the mono
+        // decoder's original single-carrier generator did it, so this
+        // scales sensibly if --rate changes. `active` stays as a cheap
+        // skip for carriers so far off that their contribution is
+        // numerically negligible (several rolloff widths out) --
+        // that's purely a performance shortcut now, not where the
+        // fade happens.
+        const double rolloffHz = sampleRate * 0.18;
         for (std::size_t carrier = 0; carrier < active.size(); ++carrier) {
-            active[carrier] =
-                std::abs(frequencyOffsets[carrier]) < sampleRate * 0.45;
+            const double offset = frequencyOffsets[carrier];
+            selectivity[carrier] = static_cast<float>(
+                std::exp(-(offset * offset) / (2.0 * rolloffHz * rolloffHz)));
+            active[carrier] = std::abs(offset) < rolloffHz * 5.0;
         }
 
         for (std::size_t n = 0; n < sampleCount; ++n) {
@@ -132,7 +148,8 @@ public:
 
                 const float amplitude =
                     envelope *
-                    (carrier == 0 ? centerAmplitude : sideAmplitude);
+                    (carrier == 0 ? centerAmplitude : sideAmplitude) *
+                    selectivity[carrier];
 
                 i += amplitude * static_cast<float>(std::cos(phase));
                 q += amplitude * static_cast<float>(std::sin(phase));
@@ -150,8 +167,7 @@ public:
     }
 
 private:
-    static constexpr double kPi =
-        3.14159265358979323846;
+    static constexpr double kPi = 3.14159265358979323846;
 
     static constexpr float videoBlack() { return 0.60f; }
     static constexpr float videoWhite() { return 0.025f; }
@@ -159,8 +175,7 @@ private:
     static constexpr float carrierAmplitude() { return 120.0f; }
 
     static uint8_t sampleByte(float value) {
-        return static_cast<uint8_t>(std::clamp(
-            static_cast<int>(std::lround(value)), 0, 255));
+        return static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(value)), 0, 255));
     }
 
     float dispatchRender(float x, float y, uint64_t lineNumber, vEffect effect = vEffect::Pong) const {

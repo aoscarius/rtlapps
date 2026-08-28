@@ -43,12 +43,23 @@ struct TunableParams {
     // top-to-bottom without having to touch lines_per_field.
     std::atomic<int> v_shift{0};
 
+    // Color hue trim (degrees), used only by PalColorSeparator (--c64).
+    // Our chroma demod has no absolute phase reference to the real
+    // broadcast subcarrier -- only a self-consistent *relative* one
+    // recovered from the color burst -- so a real captured signal will
+    // generally come out globally hue-rotated by some fixed but unknown
+    // amount (this is exactly why old NTSC sets had a physical "hue"
+    // knob; PAL sets didn't need one for this specific issue since the
+    // V-switch cancels *line-to-line* phase errors, not a constant
+    // offset). Nudge this until colors look right.
+    std::atomic<float> hue_trim_deg{0.0f};
+
     explicit TunableParams(const Config& cfg) { resetFrom(cfg); }
 
     // Restores the values a fresh run would start with. h_shift_frac /
-    // h_scale / v_shift have no CLI equivalent (there was nothing to
-    // misalign before this menu existed), so they reset to sane
-    // hand-picked defaults rather than to a Config field.
+    // h_scale / v_shift / hue_trim_deg have no CLI equivalent (there
+    // was nothing to misalign before this menu existed), so they reset
+    // to sane hand-picked defaults rather than to a Config field.
     void resetFrom(const Config& cfg) {
         sync_threshold_frac.store(cfg.sync_threshold_frac);
         invert.store(cfg.invert);
@@ -56,5 +67,6 @@ struct TunableParams {
         h_shift_frac.store(0.10f);
         h_scale.store(1.0f);
         v_shift.store(0);
+        hue_trim_deg.store(0.0f);
     }
 };
