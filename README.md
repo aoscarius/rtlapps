@@ -123,16 +123,25 @@ than the 3.2 MS/s the mono path uses. `--c64` raises the default `--rate`
 to 10000000 automatically (safely covers both standards; override with
 an explicit `--rate` if you want), but whether an RTL-SDR Blog V4
 actually sustains that reliably over your particular USB connection is
-genuinely hardware/host dependent — you may need to experiment. Full
-technical details, including exactly what's simplified compared to a
-real broadcast decoder (no delay-line comb filter, so expect more
-dot-crawl/color-fringing than a real TV), the one real difference
-between the two standards this decoder actually implements (PAL's
-V-switch; NTSC has no such thing and the code explicitly avoids letting
-noise fake one), and why there's a `HUE` control in the menu (no
-absolute phase reference to the real broadcast subcarrier — same reason
-old NTSC sets had a hue knob, and it also absorbs NTSC's fixed I/Q-vs-U/V
-axis offset since this decoder doesn't model that separately), are in
+genuinely hardware/host dependent — you may need to experiment.
+
+Expect some visible ripple/dot-crawl on saturated colors even so: a
+1-line delay comb filter is implemented (the real technique broadcast
+decoders use), but it only cancels cross-talk *between* U and V, not a
+channel's own residual from demodulating near Nyquist — at 10 MS/s
+PAL's subcarrier is sampled only ~2.3x/cycle, so part of the demod
+byproduct genuinely *aliases* onto the same frequency as the wanted
+signal, and no filter after the fact can separate two things that
+already overlap in frequency. Only a higher sample rate fixes that
+completely (see above); the chroma box-filter width is tuned to shave
+off what it safely can without blurring bars together. Full technical
+details, including the one real difference between the two standards
+this decoder actually implements (PAL's V-switch; NTSC has no such
+thing and the code explicitly avoids letting noise fake one), and why
+there's a `HUE` control in the menu (no absolute phase reference to the
+real broadcast subcarrier — same reason old NTSC sets had a hue knob,
+and it also absorbs NTSC's fixed I/Q-vs-U/V axis offset since this
+decoder doesn't model that separately), are in
 `src/dsp/composite_separator.hpp`'s header comment.
 
 Test it without hardware: `--dry-run --c64` generates a standard 8-bar

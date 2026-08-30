@@ -506,7 +506,7 @@ int main(int argc, char** argv) {
             return std::string(buf);
         },
         [&](int dir, bool fine) {
-            float step = fine ? 0.005f : 0.01f;
+            float step = fine ? 0.005f : 0.02f;
             float v = std::clamp(params.sync_threshold_frac.load() + dir * step, 0.05f, 0.95f);
             params.sync_threshold_frac.store(v);
         },

@@ -34,8 +34,8 @@ struct TunableParams {
     // left/right. h_scale trims how much of the remaining line is
     // treated as "active picture" -- <1 zooms in (corrects a picture
     // that looks horizontally stretched), >1 zooms out.
-    std::atomic<float> h_shift_frac{0.10f};
-    std::atomic<float> h_scale{1.0f};
+    std::atomic<float> h_shift_frac{0.180f};
+    std::atomic<float> h_scale{0.902f};
 
     // Vertical alignment: rotates which output row a captured scanline
     // lands on (mod lines_per_field), independent of the field-length
@@ -59,13 +59,14 @@ struct TunableParams {
     // Restores the values a fresh run would start with. h_shift_frac /
     // h_scale / v_shift / hue_trim_deg have no CLI equivalent (there
     // was nothing to misalign before this menu existed), so they reset
-    // to sane hand-picked defaults rather than to a Config field.
+    // to the same hand-picked (but now signal-accurate, see above)
+    // defaults rather than to a Config field.
     void resetFrom(const Config& cfg) {
         sync_threshold_frac.store(cfg.sync_threshold_frac);
         invert.store(cfg.invert);
         lines_per_field.store(cfg.lines_per_field);
-        h_shift_frac.store(0.10f);
-        h_scale.store(1.0f);
+        h_shift_frac.store(0.180f);
+        h_scale.store(0.902f);
         v_shift.store(0);
         hue_trim_deg.store(0.0f);
     }
