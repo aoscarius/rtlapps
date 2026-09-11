@@ -24,7 +24,7 @@
 #define DECIMATION       (CAPTURE_RATE / AUDIO_RATE)   /* = 20             */
 #define BUF_LEN          (4 * 16384)                   /* USB read chunk */
 #define PEAK_DEVIATION   75000.0   /* standard broadcast FM peak dev, Hz */
-#define DC_BLOCK_ALPHA   0.005f   /* running-average DC removal rate    */
+#define DC_BLOCK_ALPHA   0.0005f   /* running-average DC removal rate    */
 
 /* anti-alias low-pass FIR applied before decimation */
 #define FIR_TAPS         81
@@ -45,8 +45,13 @@ static volatile int do_exit = 0;
 static float prev_i = 0.0f, prev_q = 0.0f;
 static int have_prev = 0;
 
-/* DC-blocker running averages, tracked separately for I and Q */
-static float dc_i = 0.0f, dc_q = 0.0f;
+/* IF filter, tracked separately for I and Q */
+#define IF_FIR_TAPS      31
+#define IF_BANDWIDTH     100000.0f  /* 100 kHz (banda totale 200 kHz per WFM) */
+static float if_fir_coeffs[IF_FIR_TAPS];
+static float if_hist_i[IF_FIR_TAPS];
+static float if_hist_q[IF_FIR_TAPS];
+static int if_fir_pos = 0;
 
 /* FIR decimation filter state: circular buffer, O(1) push, avoids the
  * O(N) memmove-per-sample that used to run 240,000 times/sec. */
@@ -54,6 +59,7 @@ static float fir_coeffs[FIR_TAPS];
 static float fir_hist[FIR_TAPS];
 static int fir_pos = 0;
 static uint32_t sample_counter = 0;
+
 
 /* de-emphasis filter state (single-pole RC low-pass at audio rate) */
 static float deemph_alpha = 0.0f;   /* 0 = disabled */
@@ -97,7 +103,7 @@ static void iq_ring_push(const unsigned char *data, size_t n) {
 /* POP IQ: Called by the demodulator thread. Blocks if buffer is empty. */
 static size_t iq_ring_pop(unsigned char *dst, size_t max_n) {
     pthread_mutex_lock(&iq_lock);
-    while (iq_ring_count == 0 && !do_exit) {
+    while (iq_ring_count < max_n && !do_exit) {
         pthread_cond_wait(&iq_not_empty, &iq_lock);
     }
     size_t n = iq_ring_count < max_n ? iq_ring_count : max_n;
@@ -130,7 +136,7 @@ static void audio_ring_push(const int16_t *data, size_t n) {
 /* POP AUDIO: Called by the writer thread. Blocks if audio queue is empty. */
 static size_t audio_ring_pop(int16_t *dst, size_t max_n) {
     pthread_mutex_lock(&audio_lock);
-    while (audio_ring_count == 0 && !do_exit) {
+    while (audio_ring_count < (max_n / 2) && !do_exit) {
         pthread_cond_wait(&audio_not_empty, &audio_lock);
     }
     size_t n = audio_ring_count < max_n ? audio_ring_count : max_n;
@@ -146,8 +152,8 @@ static size_t audio_ring_pop(int16_t *dst, size_t max_n) {
 /* DEMODULATOR THREAD: Handles all heavy math outside the critical USB thread context */
 static void *demod_thread_fn(void *arg) {
     (void)arg;
-    unsigned char raw_chunk[4096];
-    int16_t pcm_chunk[(sizeof(raw_chunk) / 2) / DECIMATION + 2];
+    unsigned char raw_chunk[16384];
+    int16_t pcm_chunk[(sizeof(raw_chunk) / 2) / DECIMATION + 64];
 
     const float theta_to_hz = (float)CAPTURE_RATE / (2.0f * (float)M_PI);
     const float hz_to_fullscale = 32767.0f / (float)PEAK_DEVIATION;
@@ -163,14 +169,22 @@ static void *demod_thread_fn(void *arg) {
             float raw_i = (float)raw_chunk[2 * k]     - 127.5f;
             float raw_q = (float)raw_chunk[2 * k + 1] - 127.5f;
 
-            dc_i += DC_BLOCK_ALPHA * (raw_i - dc_i);
-            dc_q += DC_BLOCK_ALPHA * (raw_q - dc_q);
-            float si = raw_i - dc_i;
-            float sq = raw_q - dc_q;
+            if_hist_i[if_fir_pos] = raw_i;
+            if_hist_q[if_fir_pos] = raw_q;
+            if_fir_pos = (if_fir_pos + 1) % IF_FIR_TAPS;
+
+            float filtered_i = 0.0f;
+            float filtered_q = 0.0f;
+            int idx = if_fir_pos;
+            for (int t = 0; t < IF_FIR_TAPS; t++) {
+                filtered_i += if_fir_coeffs[t] * if_hist_i[idx];
+                filtered_q += if_fir_coeffs[t] * if_hist_q[idx];
+                idx = (idx + 1) % IF_FIR_TAPS;
+            }
 
             if (have_prev) {
-                float re = si * prev_i + sq * prev_q;
-                float im = sq * prev_i - si * prev_q;
+                float re = filtered_i * prev_i + filtered_q * prev_q;
+                float im = filtered_q * prev_i - filtered_i * prev_q;
                 float theta = atan2f(im, re);
 
                 fir_hist[fir_pos] = theta;
@@ -181,10 +195,10 @@ static void *demod_thread_fn(void *arg) {
                     sample_counter = 0;
 
                     float acc = 0.0f;
-                    int idx = fir_pos;
+                    int idx_audio = fir_pos;
                     for (int t = 0; t < FIR_TAPS; t++) {
-                        acc += fir_coeffs[t] * fir_hist[idx];
-                        idx = (idx + 1) % FIR_TAPS;
+                        acc += fir_coeffs[t] * fir_hist[idx_audio];
+                        idx_audio = (idx_audio + 1) % FIR_TAPS;
                     }
 
                     float audio = acc * theta_to_hz * hz_to_fullscale;
@@ -201,8 +215,8 @@ static void *demod_thread_fn(void *arg) {
                     pcm_chunk[pcm_n++] = (int16_t)audio;
                 }
             }
-            prev_i = si;
-            prev_q = sq;
+            prev_i = filtered_i;
+            prev_q = filtered_q;
             have_prev = 1;
         }
 
@@ -324,8 +338,8 @@ static void usage(const char *prog) {
         "\n"
         "Output is raw signed 16-bit little-endian mono PCM at 48000 Hz.\n"
         "Pipe to an audio player, e.g.:\n"
-        "  %s -f 92.6M -v 2.0 -g auto -v 0.5 | paplay --raw --rate=48000 --format=s16le --channels=1 --latency-msec=500\n"
-        "  %s -f 92.6M -v 2.0 -g auto -v 0.5 | ffplay -f s16le -ar 48000 -ac 1 -nodisp -af ""aresample=async=1"" -i -\n",
+        "  %s -f 92.6M -v 2.0 -g auto -v 0.5 | paplay --raw --rate=48000 --format=s16le --channels=1\n"
+        "  %s -f 92.6M -v 2.0 -g auto -v 0.5 | ffplay -f s16le -ar 48000 -ac 1 -nodisp -i -\n",
         prog, prog, prog);
 }
 
@@ -405,6 +419,7 @@ int main(int argc, char **argv) {
         deemph_alpha = 0.0f;
         }
 
+    design_fir_lowpass(if_fir_coeffs, IF_FIR_TAPS, CAPTURE_RATE, IF_BANDWIDTH);
     design_fir_lowpass(fir_coeffs, FIR_TAPS, CAPTURE_RATE, FIR_CUTOFF_HZ);
 
     int device_count = rtlsdr_get_device_count();
