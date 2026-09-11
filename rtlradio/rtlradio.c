@@ -1,14 +1,12 @@
 /*
- * rtl_fm_simple.c — minimal single-frequency WFM broadcast receiver (mono)
+ * rtlradio.c — minimal single-frequency WFM broadcast receiver (mono)
+ * Restructured with a 3-stage architecture to eliminate USB dropouts and audio underruns.
  *
- * See README.md for a full explanation of the signal chain and the
- * producer/consumer threading model used to avoid audio dropouts.
- *
- * Build (see CMakeLists.txt for the recommended way):
- *   gcc -O2 -o rtl_fm_simple rtl_fm_simple.c -lrtlsdr -lm -lpthread
+ * Build:
+ *   gcc -O2 -o rtlradio rtlradio.c -lrtlsdr -lm -lpthread
  *
  * Run:
- *   ./rtl_fm_simple -f 92.6M -g auto -v 1.5 | paplay --rate=48000 --format=s16le --channels=1
+ *   ./rtlradio -f 92.6M -g auto -v 1.5 | ffplay -f s16le -ar 48000 -ac 1 -nodisp -af "aresample=async=1" -i -
  */
 
 #include <stdio.h>
@@ -26,27 +24,24 @@
 #define DECIMATION       (CAPTURE_RATE / AUDIO_RATE)   /* = 20             */
 #define BUF_LEN          (4 * 16384)                   /* USB read chunk */
 #define PEAK_DEVIATION   75000.0   /* standard broadcast FM peak dev, Hz */
-#define DC_BLOCK_ALPHA   0.0005f   /* running-average DC removal rate    */
+#define DC_BLOCK_ALPHA   0.005f   /* running-average DC removal rate    */
 
 /* anti-alias low-pass FIR applied before decimation */
 #define FIR_TAPS         81
 #define FIR_CUTOFF_HZ    15000.0   /* audio bandwidth for mono broadcast */
 
-/* audio ring buffer: decouples the time-critical USB callback thread
- * from the (potentially blocking) write to the output pipe. Sized as
- * several seconds of audio so that transient stalls on either side
- * (USB/usbipd jitter, or the downstream audio player/pipe stalling)
- * get absorbed instead of causing an audible dropout. */
-#define RING_SECONDS     4
-#define RING_CAPACITY    (AUDIO_RATE * RING_SECONDS)
-#define PREBUFFER_MS     300       /* wait this much audio before first write */
-#define PREBUFFER_SAMPLES ((AUDIO_RATE * PREBUFFER_MS) / 1000)
+/* Generous ring buffer sizes to absorb system scheduling jitter */
+#define IQ_RING_CAPACITY    (BUF_LEN * 32)
+#define AUDIO_RING_SECONDS  4
+#define AUDIO_RING_CAPACITY (AUDIO_RATE * AUDIO_RING_SECONDS)
+#define PREBUFFER_MS        300        /* wait this much audio before first write */
+#define PREBUFFER_SAMPLES   ((AUDIO_RATE * PREBUFFER_MS) / 1000)
 
 static rtlsdr_dev_t *dev = NULL;
 static FILE *out = NULL;
 static volatile int do_exit = 0;
 
-/* previous (DC-corrected) IQ sample, for the FM discriminator */
+/* Filter and demodulation state variables */
 static float prev_i = 0.0f, prev_q = 0.0f;
 static int have_prev = 0;
 
@@ -66,123 +61,209 @@ static float deemph_prev = 0.0f;
 
 /* volume control, linear multiplier applied to the final audio sample */
 static float volume = 1.0f;
-
-/* diagnostics: running stats, reported to stderr roughly once/2sec */
-static double diag_in_sumsq = 0.0;
-static double diag_out_sumsq = 0.0;
-static double diag_out_peak = 0.0;
-static uint64_t diag_in_count = 0;
-static uint64_t diag_out_count = 0;
 static int digital_agc = 0;
 
-/* ---- ring buffer (single producer: USB callback thread;
- *                   single consumer: writer thread) -------------------- */
-static int16_t ring_buf[RING_CAPACITY];
-static size_t ring_read = 0, ring_write = 0, ring_count = 0;
-static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t ring_not_empty = PTHREAD_COND_INITIALIZER;
+/* Ring Buffer for raw IQ data (USB -> Demodulator) */
+static unsigned char iq_ring_buf[IQ_RING_CAPACITY];
+static size_t iq_ring_read = 0, iq_ring_write = 0, iq_ring_count = 0;
+static pthread_mutex_t iq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t iq_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_t demod_thread_id;
+
+/* Ring Buffer for Audio PCM (Demodulator -> Writer) */
+static int16_t audio_ring_buf[AUDIO_RING_CAPACITY];
+static size_t audio_ring_read = 0, audio_ring_write = 0, audio_ring_count = 0;
+static pthread_mutex_t audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t audio_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_t writer_thread_id;
 
-/* Called only from the USB callback thread. Never blocks: if the ring
- * is full (writer thread starved for too long), oldest samples are
- * overwritten rather than stalling the USB event loop -- losing a
- * little audio is far less audible than a hard xrun/dropout. */
-static void ring_push(const int16_t *data, size_t n) {
-    pthread_mutex_lock(&ring_lock);
-    if (n > RING_CAPACITY) {
-        data += (n - RING_CAPACITY);
-        n = RING_CAPACITY;
-    }
-    if (ring_count + n > RING_CAPACITY) {
-        size_t drop = (ring_count + n) - RING_CAPACITY;
-        ring_read = (ring_read + drop) % RING_CAPACITY;
-        ring_count -= drop;
+/* PUSH IQ: Called from the USB callback. Very fast and non-blocking. */
+static void iq_ring_push(const unsigned char *data, size_t n) {
+    pthread_mutex_lock(&iq_lock);
+    if (iq_ring_count + n > IQ_RING_CAPACITY) {
+        size_t drop = (iq_ring_count + n) - IQ_RING_CAPACITY;
+        iq_ring_read = (iq_ring_read + drop) % IQ_RING_CAPACITY;
+        iq_ring_count -= drop;
     }
     for (size_t i = 0; i < n; i++) {
-        ring_buf[ring_write] = data[i];
-        ring_write = (ring_write + 1) % RING_CAPACITY;
+        iq_ring_buf[iq_ring_write] = data[i];
+        iq_ring_write = (iq_ring_write + 1) % IQ_RING_CAPACITY;
     }
-    ring_count += n;
-    pthread_cond_signal(&ring_not_empty);
-    pthread_mutex_unlock(&ring_lock);
+    iq_ring_count += n;
+    pthread_cond_signal(&iq_not_empty);
+    pthread_mutex_unlock(&iq_lock);
 }
 
-/* Called only from the writer thread. Blocks (cheaply, via condvar)
- * until at least one sample is available or shutdown is requested. */
-static size_t ring_pop(int16_t *dst, size_t max_n) {
-    pthread_mutex_lock(&ring_lock);
-    while (ring_count == 0 && !do_exit) {
-        pthread_cond_wait(&ring_not_empty, &ring_lock);
+/* POP IQ: Called by the demodulator thread. Blocks if buffer is empty. */
+static size_t iq_ring_pop(unsigned char *dst, size_t max_n) {
+    pthread_mutex_lock(&iq_lock);
+    while (iq_ring_count == 0 && !do_exit) {
+        pthread_cond_wait(&iq_not_empty, &iq_lock);
     }
-    size_t n = ring_count < max_n ? ring_count : max_n;
+    size_t n = iq_ring_count < max_n ? iq_ring_count : max_n;
     for (size_t i = 0; i < n; i++) {
-        dst[i] = ring_buf[ring_read];
-        ring_read = (ring_read + 1) % RING_CAPACITY;
+        dst[i] = iq_ring_buf[iq_ring_read];
+        iq_ring_read = (iq_ring_read + 1) % IQ_RING_CAPACITY;
     }
-    ring_count -= n;
-    pthread_mutex_unlock(&ring_lock);
+    iq_ring_count -= n;
+    pthread_mutex_unlock(&iq_lock);
     return n;
 }
 
-/* Writer thread: the only thread that ever touches `out`. It can
- * block on write() as long as it wants without affecting USB capture. */
+/* PUSH AUDIO: Pushes calculated PCM samples into the audio queue. */
+static void audio_ring_push(const int16_t *data, size_t n) {
+    pthread_mutex_lock(&audio_lock);
+    if (audio_ring_count + n > AUDIO_RING_CAPACITY) {
+        size_t drop = (audio_ring_count + n) - AUDIO_RING_CAPACITY;
+        audio_ring_read = (audio_ring_read + drop) % AUDIO_RING_CAPACITY;
+        audio_ring_count -= drop;
+    }
+    for (size_t i = 0; i < n; i++) {
+        audio_ring_buf[audio_ring_write] = data[i];
+        audio_ring_write = (audio_ring_write + 1) % AUDIO_RING_CAPACITY;
+    }
+    audio_ring_count += n;
+    pthread_cond_signal(&audio_not_empty);
+    pthread_mutex_unlock(&audio_lock);
+}
+
+/* POP AUDIO: Called by the writer thread. Blocks if audio queue is empty. */
+static size_t audio_ring_pop(int16_t *dst, size_t max_n) {
+    pthread_mutex_lock(&audio_lock);
+    while (audio_ring_count == 0 && !do_exit) {
+        pthread_cond_wait(&audio_not_empty, &audio_lock);
+    }
+    size_t n = audio_ring_count < max_n ? audio_ring_count : max_n;
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = audio_ring_buf[audio_ring_read];
+        audio_ring_read = (audio_ring_read + 1) % AUDIO_RING_CAPACITY;
+    }
+    audio_ring_count -= n;
+    pthread_mutex_unlock(&audio_lock);
+    return n;
+}
+
+/* DEMODULATOR THREAD: Handles all heavy math outside the critical USB thread context */
+static void *demod_thread_fn(void *arg) {
+    (void)arg;
+    unsigned char raw_chunk[4096];
+    int16_t pcm_chunk[(sizeof(raw_chunk) / 2) / DECIMATION + 2];
+
+    const float theta_to_hz = (float)CAPTURE_RATE / (2.0f * (float)M_PI);
+    const float hz_to_fullscale = 32767.0f / (float)PEAK_DEVIATION;
+
+    while (!do_exit) {
+        size_t n_bytes = iq_ring_pop(raw_chunk, sizeof(raw_chunk));
+        if (n_bytes == 0) continue;
+
+        uint32_t n_samples = n_bytes / 2;
+        size_t pcm_n = 0;
+
+        for (uint32_t k = 0; k < n_samples; k++) {
+            float raw_i = (float)raw_chunk[2 * k]     - 127.5f;
+            float raw_q = (float)raw_chunk[2 * k + 1] - 127.5f;
+
+            dc_i += DC_BLOCK_ALPHA * (raw_i - dc_i);
+            dc_q += DC_BLOCK_ALPHA * (raw_q - dc_q);
+            float si = raw_i - dc_i;
+            float sq = raw_q - dc_q;
+
+            if (have_prev) {
+                float re = si * prev_i + sq * prev_q;
+                float im = sq * prev_i - si * prev_q;
+                float theta = atan2f(im, re);
+
+                fir_hist[fir_pos] = theta;
+                fir_pos = (fir_pos + 1) % FIR_TAPS;
+
+                sample_counter++;
+                if (sample_counter >= DECIMATION) {
+                    sample_counter = 0;
+
+                    float acc = 0.0f;
+                    int idx = fir_pos;
+                    for (int t = 0; t < FIR_TAPS; t++) {
+                        acc += fir_coeffs[t] * fir_hist[idx];
+                        idx = (idx + 1) % FIR_TAPS;
+                    }
+
+                    float audio = acc * theta_to_hz * hz_to_fullscale;
+
+                    if (deemph_alpha > 0.0f) {
+                        deemph_prev += deemph_alpha * (audio - deemph_prev);
+                        audio = deemph_prev;
+                    }
+
+                    audio *= volume;
+
+                    if (audio > 32767.0f) audio = 32767.0f;
+                    if (audio < -32768.0f) audio = -32768.0f;
+                    pcm_chunk[pcm_n++] = (int16_t)audio;
+                }
+            }
+            prev_i = si;
+            prev_q = sq;
+            have_prev = 1;
+        }
+
+        if (pcm_n > 0) {
+            audio_ring_push(pcm_chunk, pcm_n);
+        }
+    }
+    return NULL;
+}
+
+/* WRITER THREAD STAGE: Consumes prepared audio and pushes it to stdout/pipe */
 static void *writer_thread_fn(void *arg) {
     (void)arg;
     int16_t chunk[4096];
 
-    /* prebuffer: wait for a small cushion of audio before the first
-     * write, so playback starts smoothly instead of stuttering while
-     * the pipeline is still spinning up. */
+    /* Prebuffering phase to avoid immediate underrun */
     for (;;) {
-        pthread_mutex_lock(&ring_lock);
-        size_t c = ring_count;
-        pthread_mutex_unlock(&ring_lock);
+        pthread_mutex_lock(&audio_lock);
+        size_t c = audio_ring_count;
+        pthread_mutex_unlock(&audio_lock);
         if (c >= PREBUFFER_SAMPLES || do_exit) break;
         usleep(5000);
     }
 
     while (!do_exit) {
-        size_t n = ring_pop(chunk, sizeof(chunk) / sizeof(chunk[0]));
+        size_t n = audio_ring_pop(chunk, sizeof(chunk) / sizeof(chunk[0]));
         if (n > 0 && out) {
-            fwrite(chunk, sizeof(int16_t), n, out);
-        }
-    }
-    /* drain whatever's left after do_exit was set */
-    size_t n;
-    while ((n = ring_pop(chunk, sizeof(chunk) / sizeof(chunk[0]))) > 0) {
-        if (out) {
             fwrite(chunk, sizeof(int16_t), n, out);
         }
     }
     return NULL;
 }
 
-static void handle_sigint(int sig) {
-    (void)sig;
-    do_exit = 1;
-    pthread_cond_broadcast(&ring_not_empty);
-    if (dev) rtlsdr_cancel_async(dev);
+/* Static utility functions for DSP, frequency parsing, and hardware settings */
+static void handle_sigint(int sig) { 
+    (void)sig; 
+    do_exit = 1; 
+    pthread_cond_broadcast(&iq_not_empty); 
+    pthread_cond_broadcast(&audio_not_empty); 
+    if (dev) rtlsdr_cancel_async(dev); 
 }
 
 /* Design a windowed-sinc low-pass FIR (linear phase, symmetric). */
-static void design_fir_lowpass(float *coeffs, int ntaps, double fs, double fc) {
-    double fc_norm = fc / fs;
-    int mid = (ntaps - 1) / 2;
-    double sum = 0.0;
+static void design_fir_lowpass(float *coeffs, int ntaps, double fs, double fc) { 
+    double fc_norm = fc / fs; 
+    int mid = (ntaps - 1) / 2; 
+    double sum = 0.0; 
 
-    for (int n = 0; n < ntaps; n++) {
-        int m = n - mid;
+    for (int n = 0; n < ntaps; n++) { 
+        int m = n - mid; 
         double sinc;
         if (m == 0) {
             sinc = 2.0 * fc_norm;
         } else {
             sinc = sin(2.0 * M_PI * fc_norm * m) / (M_PI * m);
         }
-        double w = 0.54 - 0.46 * cos(2.0 * M_PI * n / (ntaps - 1));
-        double v = sinc * w;
-        coeffs[n] = (float)v;
-        sum += v;
-    }
+        double w = 0.54 - 0.46 * cos(2.0 * M_PI * n / (ntaps - 1)); 
+        double v = sinc * w; 
+        coeffs[n] = (float)v; 
+        sum += v; 
+    } 
     for (int n = 0; n < ntaps; n++) {
         coeffs[n] = (float)(coeffs[n] / sum);
     }
@@ -213,101 +294,12 @@ static int pick_nearest_gain(rtlsdr_dev_t *d, int requested_tenth_db) {
     return best;
 }
 
-/* Called by librtlsdr for every USB packet of raw IQ bytes. This is
- * the time-critical path: it must never block. It demodulates and
- * pushes finished audio into the ring buffer, then returns. */
+/* USB INTERFACE STAGE: The callback only handles quick offloading of raw bytes */
 static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
     (void)ctx;
     if (do_exit || len < 2) return;
-
-    uint32_t n_samples = len / 2;
-    int16_t pcm[BUF_LEN / 2 / DECIMATION + 2];
-    size_t pcm_n = 0;
-
-    const float theta_to_hz = (float)CAPTURE_RATE / (2.0f * (float)M_PI);
-    const float hz_to_fullscale = 32767.0f / (float)PEAK_DEVIATION;
-
-    for (uint32_t k = 0; k < n_samples; k++) {
-        float raw_i = (float)buf[2 * k]     - 127.5f;
-        float raw_q = (float)buf[2 * k + 1] - 127.5f;
-
-        /* DC blocker: removes the zero-IF LO-leakage spike that
-         * otherwise corrupts the atan2-based discriminator. */
-        dc_i += DC_BLOCK_ALPHA * (raw_i - dc_i);
-        dc_q += DC_BLOCK_ALPHA * (raw_q - dc_q);
-        float si = raw_i - dc_i;
-        float sq = raw_q - dc_q;
-
-        diag_in_sumsq += (double)(si * si + sq * sq);
-        diag_in_count++;
-
-        if (have_prev) {
-            /* z[n] * conj(z[n-1]); its angle is proportional to
-             * instantaneous frequency (the FM-demodulated signal). */
-            float re = si * prev_i + sq * prev_q;
-            float im = sq * prev_i - si * prev_q;
-            float theta = atan2f(im, re);
-
-            fir_hist[fir_pos] = theta;
-            fir_pos = (fir_pos + 1) % FIR_TAPS;
-
-            sample_counter++;
-            if (sample_counter >= DECIMATION) {
-                sample_counter = 0;
-
-                /* fir_pos now points at the oldest sample in the
-                 * history; walk forward from there (oldest->newest). */
-                float acc = 0.0f;
-                int idx = fir_pos;
-                for (int t = 0; t < FIR_TAPS; t++) {
-                    acc += fir_coeffs[t] * fir_hist[idx];
-                    idx = (idx + 1) % FIR_TAPS;
-                }
-
-                float audio = acc * theta_to_hz * hz_to_fullscale;
-
-                if (deemph_alpha > 0.0f) {
-                    deemph_prev += deemph_alpha * (audio - deemph_prev);
-                    audio = deemph_prev;
-                }
-
-                audio *= volume;
-
-                if (audio > 32767.0f) audio = 32767.0f;
-                if (audio < -32768.0f) audio = -32768.0f;
-                pcm[pcm_n++] = (int16_t)audio;
-
-                diag_out_sumsq += (double)audio * (double)audio;
-                if (fabs((double)audio) > diag_out_peak) diag_out_peak = fabs((double)audio);
-                diag_out_count++;
-
-                if (diag_out_count >= AUDIO_RATE * 2) {
-                    double in_rms = sqrt(diag_in_sumsq / (double)diag_in_count);
-                    double out_rms = sqrt(diag_out_sumsq / (double)diag_out_count);
-                    char line[192];
-                    int llen = snprintf(line, sizeof(line),
-                        "[level] input RMS: %.1f/127 (%.0f%%)  "
-                        "audio RMS: %.0f/32767  audio peak: %.0f/32767\n",
-                        in_rms, 100.0 * in_rms / 127.0, out_rms, diag_out_peak);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-                    if (llen > 0) write(2, line, (size_t)llen);
-#pragma GCC diagnostic pop 
-                    diag_in_sumsq = 0.0; diag_in_count = 0;
-                    diag_out_sumsq = 0.0; diag_out_count = 0; diag_out_peak = 0.0;
-                }
-            }
-        }
-        prev_i = si;
-        prev_q = sq;
-        have_prev = 1;
-    }
-
-    if (pcm_n > 0) {
-        ring_push(pcm, pcm_n);   /* non-blocking; returns immediately */
-    }
+    iq_ring_push(buf, len);
 }
-
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s -f <freq_hz> [-d <device_index>] [-g <gain_tenth_db|auto>] "
@@ -337,25 +329,25 @@ static void usage(const char *prog) {
         prog, prog, prog);
 }
 
-static double parse_freq(const char *s) {
-    char clean[64];
-    size_t n = strlen(s);
+static double parse_freq(const char *s) { 
+    char clean[64]; 
+    size_t n = strlen(s); 
     if (n >= sizeof(clean)) n = sizeof(clean) - 1;
 
     int dot_count = 0;
     for (size_t i = 0; i < n; i++) if (s[i] == '.') dot_count++;
 
-    size_t j = 0;
-    for (size_t i = 0; i < n; i++) {
+    size_t j = 0; 
+    for (size_t i = 0; i < n; i++) { 
         char c = s[i];
         if (c == ',' || c == '_' || c == ' ' || c == '\'') continue;
         if (c == '.' && dot_count > 1) continue;
         clean[j++] = c;
-    }
-    clean[j] = '\0';
+    } 
+    clean[j] = '\0'; 
 
-    char *end;
-    double val = strtod(clean, &end);
+    char *end; 
+    double val = strtod(clean, &end); 
 
     if (*end == 'M' || *end == 'm') { val *= 1e6; end++; }
     else if (*end == 'k' || *end == 'K') { val *= 1e3; end++; }
@@ -389,7 +381,7 @@ int main(int argc, char **argv) {
             case 'g':
                 if (strcmp(optarg, "auto") == 0) { gain_auto = 1; }
                 else { gain_auto = 0; gain_tenth_db = atoi(optarg); }
-                break;
+            break;
             case 'e': deemph_us = atof(optarg); break;
             case 'v': volume = (float)atof(optarg); break;
             case 'p': ppm = atoi(optarg); break;
@@ -411,7 +403,7 @@ int main(int argc, char **argv) {
         deemph_alpha = (float)(dt / (tau + dt));
     } else {
         deemph_alpha = 0.0f;
-    }
+        }
 
     design_fir_lowpass(fir_coeffs, FIR_TAPS, CAPTURE_RATE, FIR_CUTOFF_HZ);
 
@@ -429,7 +421,7 @@ int main(int argc, char **argv) {
     rtlsdr_set_sample_rate(dev, CAPTURE_RATE);
     rtlsdr_set_center_freq(dev, (uint32_t)freq_hz);
     if (ppm != 0) rtlsdr_set_freq_correction(dev, ppm);
-
+    
     if (gain_auto) {
         rtlsdr_set_tuner_gain_mode(dev, 0);
     } else {
@@ -455,26 +447,25 @@ int main(int argc, char **argv) {
         return 1;
     }
     setvbuf(out, NULL, _IONBF, 1 << 16); /* 64KB stdio buffer in the writer thread */
-
+    
     fprintf(stderr,
-        "Tuned to %.4f MHz, capture %d Hz -> audio %d Hz, de-emphasis %.0f us, "
-        "volume x%.2f. Ctrl+C to stop.\n",
-        freq_hz / 1e6, CAPTURE_RATE, AUDIO_RATE, deemph_us, volume);
+    "Tuned to %.4f MHz, capture %d Hz -> audio %d Hz, de-emphasis %.0f us, "
+    "volume x%.2f. Ctrl+C to stop.\n",
+    freq_hz / 1e6, CAPTURE_RATE, AUDIO_RATE, deemph_us, volume);
 
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
 
-    if (pthread_create(&writer_thread_id, NULL, writer_thread_fn, NULL) != 0) {
-        fprintf(stderr, "Failed to start audio writer thread\n");
-        rtlsdr_close(dev);
-        return 1;
-    }
+    pthread_create( & demod_thread_id, NULL, demod_thread_fn, NULL);
+    pthread_create( & writer_thread_id, NULL, writer_thread_fn, NULL);
 
-    rtlsdr_reset_buffer(dev);
+    rtlsdr_reset_buffer(dev);    
     rtlsdr_read_async(dev, rtlsdr_callback, NULL, 32, BUF_LEN);
 
     do_exit = 1;
-    pthread_cond_broadcast(&ring_not_empty);
+    pthread_cond_broadcast( & iq_not_empty);
+    pthread_join(demod_thread_id, NULL);
+    pthread_cond_broadcast( & audio_not_empty);
     pthread_join(writer_thread_id, NULL);
 
     if (out != stdout) fclose(out);

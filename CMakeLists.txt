@@ -71,7 +71,7 @@ add_custom_target(run_${TARGET_APPTV}
 )
 
 add_custom_target(run_${TARGET_APPRADIO}
-    COMMAND $<TARGET_FILE:${TARGET_APPRADIO}> -f 92.6M -v 2.0 -g 280 -v 0.5 | paplay --raw --rate=48000 --format=s16le --channels=1 --latency-msec=100
+    COMMAND $<TARGET_FILE:${TARGET_APPRADIO}> -f 92.6M -v 2.0 -g auto -v 0.5 -a | paplay --raw --rate=48000 --format=s16le --channels=1 --latency-msec=100
     DEPENDS ${TARGET_APPRADIO}
     COMMENT "Starting ${TARGET_APPRADIO}..."
 )
