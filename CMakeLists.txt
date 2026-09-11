@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(rtltv LANGUAGES CXX)
+project(rtlapps LANGUAGES C CXX)
+
+set(TARGET_APPTV "rtltv")
+set(TARGET_APPRADIO "rtlradio")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,32 +25,53 @@ find_package(SDL2 REQUIRED)
 # pkg-config first, then a manual header/lib search.
 find_package(RTLSDR REQUIRED)
 
-add_executable(${CMAKE_PROJECT_NAME}
-    src/main.cpp
-    src/display/crt_display.cpp
-    src/display/osd_menu.cpp
+add_executable(${TARGET_APPTV}
+    rtltv/main.cpp
+    rtltv/display/crt_display.cpp
+    rtltv/display/osd_menu.cpp
+)
+add_executable(${TARGET_APPRADIO}
+    rtlradio/rtlradio.c
 )
 
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
+target_include_directories(${TARGET_APPTV} PRIVATE rtltv)
+target_include_directories(${TARGET_APPRADIO} PRIVATE rtlradio)
 
 if(TARGET SDL2::SDL2)
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL2::SDL2)
+    target_link_libraries(${TARGET_APPTV} PRIVATE SDL2::SDL2)
 elseif(TARGET SDL2::SDL2-static)
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE SDL2::SDL2-static)
+    target_link_libraries(${TARGET_APPTV} PRIVATE SDL2::SDL2-static)
 else()
     # Legacy find-module style (no imported target provided).
-    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${SDL2_INCLUDE_DIRS})
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${SDL2_LIBRARIES})
+    target_include_directories(${TARGET_APPTV} PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(${TARGET_APPTV} PRIVATE ${SDL2_LIBRARIES})
 endif()
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE RTLSDR::rtlsdr Threads::Threads)
+target_link_libraries(${TARGET_APPTV} PRIVATE RTLSDR::rtlsdr Threads::Threads)
+target_link_libraries(${TARGET_APPRADIO} PRIVATE RTLSDR::rtlsdr m Threads::Threads)
 
-target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+target_compile_options(${TARGET_APPTV} PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>
+)
+target_compile_options(${TARGET_APPRADIO} PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>
 )
 
-message(STATUS "${CMAKE_PROJECT_NAME}: SDL2 include dirs:  ${SDL2_INCLUDE_DIRS}")
-message(STATUS "${CMAKE_PROJECT_NAME}: RTLSDR include dir: ${RTLSDR_INCLUDE_DIR}")
-message(STATUS "${CMAKE_PROJECT_NAME}: RTLSDR library:     ${RTLSDR_LIBRARY}")
+message(STATUS "SDL2 include dirs:  ${SDL2_INCLUDE_DIRS}")
+message(STATUS "RTLSDR include dir: ${RTLSDR_INCLUDE_DIR}")
+message(STATUS "RTLSDR library:     ${RTLSDR_LIBRARY}")
 
-install(TARGETS ${CMAKE_PROJECT_NAME} RUNTIME DESTINATION bin)
+install(TARGETS ${TARGET_APPTV} RUNTIME DESTINATION bin)
+install(TARGETS ${TARGET_APPRADIO} RUNTIME DESTINATION bin)
+
+add_custom_target(run_${TARGET_APPTV}
+    COMMAND $<TARGET_FILE:${TARGET_APPTV}>
+    DEPENDS ${TARGET_APPTV}
+    COMMENT "Starting ${TARGET_APPTV}..."
+)
+
+add_custom_target(run_${TARGET_APPRADIO}
+    COMMAND $<TARGET_FILE:${TARGET_APPRADIO}> -f 92.6M -v 2.0 -g 280 -v 0.5 | paplay --raw --rate=48000 --format=s16le --channels=1 --latency-msec=100
+    DEPENDS ${TARGET_APPRADIO}
+    COMMENT "Starting ${TARGET_APPRADIO}..."
+)

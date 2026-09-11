@@ -1,0 +1,3 @@
+[submodule "rtllib"]
+	path = rtllib
+	url = https://github.com/rtlsdrblog/rtl-sdr-blog.git
