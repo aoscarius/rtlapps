@@ -1,3 +1,5 @@
 build
 *.wav
 *.pcm
+.venv
+.vscode
