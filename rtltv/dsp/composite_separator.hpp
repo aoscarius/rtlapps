@@ -149,7 +149,7 @@ private:
         var /= recentLens_.size();
         double relStdDev = std::sqrt(var) / std::max(mean, 1.0);
 
-        locked_ = relStdDev < 0.08;
+        locked_ = relStdDev < .9; // 90% line-to-line jitter looks like a real sync train
         fb_.markLock(locked_);
     }
 
@@ -271,6 +271,7 @@ private:
         size_t chromaWindow = std::max<size_t>(2, lumaWindow * 4);
 
         bool invertLuma = params_.invert.load(std::memory_order_relaxed);
+        float c_gain = std::clamp(params_.contrast_gain.load(std::memory_order_relaxed), 0.1f, 8.0f);
         int lpf = std::max(1, params_.lines_per_field.load(std::memory_order_relaxed));
         int vShift = params_.v_shift.load(std::memory_order_relaxed);
         int outLine = ((curLine_ + vShift) % lpf + lpf) % lpf;
@@ -300,7 +301,7 @@ private:
             size_t lumaTo = std::min(n, lumaFrom + lumaWindow);
             double lumaSum = 0.0;
             for (size_t k = lumaFrom; k < lumaTo; ++k) lumaSum += samples[k];
-            double lumaRaw = lumaSum / std::max<size_t>(1, lumaTo - lumaFrom);
+            double lumaRaw = (lumaSum / std::max<size_t>(1, lumaTo - lumaFrom)) * c_gain;
 
             // Chroma: synchronous quadrature demod referenced to this
             // line's burst-derived axis, box-filtered to baseband.
@@ -359,7 +360,7 @@ private:
             // calibrated one -- there's no absolute reference for "100%
             // saturation" on an arbitrary composite source, so if colors
             // look over/under-saturated, kChromaGain is the knob.
-            double yNorm = (lumaRaw - envMin_) / range;   // 0..1, high = sync/black
+            double yNorm = (lumaRaw - envMin_) / range;    // 0..1, high = sync/black
             double y = 1.0 - yNorm;                        // invert: low carrier = bright
             if (invertLuma) y = 1.0 - y;
             y = std::clamp(y, 0.0, 1.0) * 255.0;
@@ -395,6 +396,7 @@ private:
         int vShift = params_.v_shift.load(std::memory_order_relaxed);
         int outLine = ((curLine_ + vShift) % lpf + lpf) % lpf;
         bool invertLuma = params_.invert.load(std::memory_order_relaxed);
+        float c_gain = std::clamp(params_.contrast_gain.load(std::memory_order_relaxed), 0.1f, 8.0f);
         float range = std::max(envMax_ - envMin_, 1e-6f);
 
         std::vector<uint8_t> rgb((size_t)cfg_.out_width * 3);
@@ -403,10 +405,10 @@ private:
             double t = (double)px / (cfg_.out_width - 1);
             size_t idx = start + (size_t)(t * (len - 1));
             if (idx >= samples.size()) idx = samples.empty() ? 0 : samples.size() - 1;
-            double norm = samples.empty() ? 0.0 : (samples[idx] - envMin_) / range;
-            double y = 1.0 - norm;
+            float norm = samples.empty() ? 0.0 : (samples[idx] - envMin_) / range;
+            float y = (1.0 - norm) * c_gain;
             if (invertLuma) y = 1.0 - y;
-            uint8_t g = clampByte(std::clamp(y, 0.0, 1.0) * 255.0);
+            uint8_t g = clampByte(std::clamp(y, 0.0f, 1.0f) * 255.0f);
             rgb[(size_t)px * 3 + 0] = g;
             rgb[(size_t)px * 3 + 1] = g;
             rgb[(size_t)px * 3 + 2] = g;

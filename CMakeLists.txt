@@ -83,7 +83,7 @@ install(TARGETS ${TARGET_APPTV} RUNTIME DESTINATION bin)
 install(TARGETS ${TARGET_APPRADIO} RUNTIME DESTINATION bin)
 
 add_custom_target(run_${TARGET_APPTV}
-    COMMAND $<TARGET_FILE:${TARGET_APPTV}> -P -c 4 -r 2400000 -g 95 -L 306 -s 0.68 --play-file pongontv.iq
+    COMMAND $<TARGET_FILE:${TARGET_APPTV}> -r 2400000 -s 0.78 --dry-run
     DEPENDS ${TARGET_APPTV}
     COMMENT "Starting ${TARGET_APPTV}..."
 )

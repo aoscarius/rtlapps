@@ -54,6 +54,18 @@ struct TunableParams {
     // offset). Nudge this until colors look right.
     std::atomic<float> hue_trim_deg{0.0f};
 
+    // Contrast/gain applied to the normalized envelope before mapping
+    // to brightness, in SyncSeparator (mono path only). Real captured
+    // signals can have much weaker native black/white separation than
+    // this project's own clean synthetic test signals -- multiplying
+    // the normalized envelope by a gain >1 before clamping stretches
+    // that separation back out. 1.0 = no change (matches a clean
+    // signal); found empirically via a real capture that ~4.0 gave
+    // good black/white separation on a particular weak/noisy signal --
+    // there's no universally "correct" value, it depends on how much
+    // native contrast the actual signal has.
+    std::atomic<float> contrast_gain{1.0f};
+
     explicit TunableParams(const Config& cfg) { resetFrom(cfg); }
 
     // Restores the values a fresh run would start with. h_shift_frac /
@@ -69,5 +81,6 @@ struct TunableParams {
         h_scale.store(0.902f);
         v_shift.store(0);
         hue_trim_deg.store(0.0f);
+        contrast_gain.store(3.0f);
     }
 };

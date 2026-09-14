@@ -80,11 +80,11 @@ private:
         var /= recentLens_.size();
         double relStdDev = std::sqrt(var) / std::max(mean, 1.0);
 
-        locked_ = relStdDev < 1.00; // <100% line-to-line jitter looks like a real sync train
+        locked_ = relStdDev < .9; // 90% line-to-line jitter looks like a real sync train
         fb_.markLock(locked_);
     }
 
-    void emitLine(const std::vector<float>& samples, float s_gain = 4.0f) {
+    void emitLine(const std::vector<float>& samples) {
         size_t n = samples.size();
         if (n < 8) return;
 
@@ -101,13 +101,14 @@ private:
         size_t activeLen = (size_t)std::clamp((float)maxLen * scale, 4.0f, (float)maxLen);
 
         bool invert = params_.invert.load(std::memory_order_relaxed);
+        float c_gain = std::clamp(params_.contrast_gain.load(std::memory_order_relaxed), 0.1f, 8.0f);
 
         std::vector<uint8_t> px(cfg_.out_width);
         for (int x = 0; x < cfg_.out_width; ++x) {
             double t = (double)x / (cfg_.out_width - 1);
             size_t idx = start + (size_t)(t * (activeLen - 1));
             if (idx >= n) idx = n - 1;
-            float norm = samples[idx] * s_gain;
+            float norm = samples[idx] * c_gain;
             float brightness = 1.0f - norm; // invert: low carrier = bright
             if (invert) brightness = 1.0f - brightness;
             brightness = std::clamp(brightness, 0.0f, 1.0f);

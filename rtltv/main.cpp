@@ -350,6 +350,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         rtlsdr_set_sample_rate(dev, cfg.sample_rate);
+
+        // The RTL2832U derives its sample rate by dividing a fixed
+        // reference clock by an integer, so not every requested rate is
+        // achievable exactly -- the driver silently rounds to the
+        // nearest one it can actually generate. Everything downstream
+        // depends on cfg.sample_rate being the *actual* rate, not the
+        // requested one, so read it back rather than trusting the
+        // value we asked for.
+        uint32_t actualRate = rtlsdr_get_sample_rate(dev);
+        if (actualRate != 0 && actualRate != cfg.sample_rate) {
+            std::printf("Note: requested %.3f MS/s, dongle actually running at %.3f MS/s "
+                        "(nearest rate its clock divider can produce) -- using the actual rate.\n",
+                        cfg.sample_rate / 1e6, actualRate / 1e6);
+            cfg.sample_rate = actualRate;
+        }
+
         rtlsdr_set_center_freq(dev, cfg.center_freq);
         rtlsdr_set_freq_correction(dev, cfg.ppm_correction);
         if (cfg.gain_tenth_db < 0) {
@@ -416,8 +432,8 @@ int main(int argc, char** argv) {
     // Every item here targets exactly the two things a person actually
     // needs to adjust to get a picture: locking onto the carrier
     // (FREQ/PPM/GAIN/SYNC LVL/LINES-FLD) and aligning the decoded image
-    // once locked (H-POS/H-WIDTH/V-SHIFT/INVERT/HUE). Hardware settings
-    // (FREQ/GAIN/PPM) push straight to the tuner via rtlsdr_set_*(),
+    // once locked (H-POS/H-WIDTH/V-SHIFT/INVERT/HUE/CONTRAST). Hardware
+    // settings (FREQ/GAIN/PPM) push straight to the tuner via rtlsdr_set_*(),
     // guarded by `usingRealHardware`; decode-side settings write into
     // the atomics in `params` that SyncSeparator/CompositeColorSeparator read
     // on the processing thread.
@@ -571,6 +587,21 @@ int main(int argc, char** argv) {
         [&]() { return params.invert.load() ? std::string("ON") : std::string("OFF"); },
         [&](int dir, bool) { (void)dir; params.invert.store(!params.invert.load()); },
         [&]() { params.invert.store(!params.invert.load()); }
+    });
+
+    menu.addItem(MenuItem{
+        "CONTRAST",
+        [&]() {
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%.2fX", params.contrast_gain.load());
+            return std::string(buf);
+        },
+        [&](int dir, bool fine) {
+            float step = fine ? 0.1f : 0.5f;
+            float v = std::clamp(params.contrast_gain.load() + dir * step, 0.1f, 8.0f);
+            params.contrast_gain.store(v);
+        },
+        nullptr
     });
 
     if (colorMode) {
